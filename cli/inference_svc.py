@@ -18,6 +18,7 @@ def build_model(
     config: DictConfig,
     device: str = "cuda",
     use_fp16: bool = False,
+    compile_model: bool = False,
 ):
     """
     Build the model from the pre-trained model path and model configuration.
@@ -27,6 +28,7 @@ def build_model(
         config (DictConfig): Model configuration.
         device (str, optional): Device to use. Defaults to "cuda".
         use_fp16 (bool, optional): If True and device is CUDA, convert model to FP16 after load. Defaults to False.
+        compile_model (bool, optional): Opt into compilation without CUDA graphs. Defaults to False.
 
     Returns:
         SoulXSingerSVC: The initialized model.
@@ -54,11 +56,13 @@ def build_model(
         model.mel.float()
         print("Model converted to FP16 (mel kept in FP32).")
     print("Model checkpoint loaded.")
-    print("Compiling diff_estimator with torch.compile (mode=reduce-overhead)...")
-    model.cfm_decoder.model.diff_estimator = torch.compile(
-        model.cfm_decoder.model.diff_estimator, mode="reduce-overhead"
-    )
-    print("diff_estimator compiled.")
+    # Gradio can reuse this model from a different worker thread. CUDA graph
+    # managers created by reduce-overhead are thread-local; keep eager default.
+    if compile_model:
+        model.cfm_decoder.model.diff_estimator = torch.compile(
+            model.cfm_decoder.model.diff_estimator, options={"triton.cudagraphs": False}
+        )
+        print("diff_estimator compilation enabled (CUDA graphs disabled).")
     model.eval()
     model.to(device)
 

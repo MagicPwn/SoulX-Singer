@@ -94,6 +94,22 @@ def _print_exception(context: str) -> None:
 	print(f"[{context}]\n{traceback.format_exc()}", file=sys.stderr, flush=True)
 
 
+def _report_failure(context: str, error: Exception, save_path: Path, parameters: dict) -> str:
+	"""Keep traceback text, not exception/model objects, in session diagnostics."""
+	message = f"{context}: {type(error).__name__}: {error!r}"
+	_print_exception(context)
+	parameter_text = "\n".join(f"{name}={value!r}" for name, value in parameters.items())
+	report = f"{message}\n\nParameters:\n{parameter_text}\n\n{traceback.format_exc()}"
+	log_path = save_path / "error.log"
+	try:
+		save_path.mkdir(parents=True, exist_ok=True)
+		log_path.write_text(report, encoding="utf-8")
+	except OSError as log_error:
+		_print_exception("writing SVC diagnostics")
+		return f"{message}\nCould not write diagnostics to {log_path}: {type(log_error).__name__}: {log_error!r}"
+	return f"{message}\nDiagnostics: {log_path}"
+
+
 def _get_device() -> str:
 	return "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -182,7 +198,8 @@ class AppState:
 				torch.cuda.empty_cache()
 			return True, "ok", vocal_wav, vocal_f0
 		except Exception as e:
-			return False, f"preprocess failed: {e}", None, None
+			message = _report_failure("preprocess failed", e, save_path, {"vocal_sep": vocal_sep})
+			return False, message, None, None
 
 	def run_svc(
 		self,
@@ -262,7 +279,12 @@ class AppState:
 				torch.cuda.empty_cache()
 			return True, "svc inference done", generated
 		except Exception as e:
-			return False, f"svc inference failed: {e}", None
+			message = _report_failure("svc inference failed", e, session_base, {
+				"auto_shift": auto_shift, "auto_mix_acc": auto_mix_acc,
+				"pitch_shift": pitch_shift, "n_step": n_step, "cfg": cfg, "seed": seed,
+				"device": self.device, "use_fp16": self.use_fp16,
+			})
+			return False, message, None
 
 
 APP_STATE = None
@@ -310,7 +332,7 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		)
 		if not prompt_ok or prompt_wav is None or prompt_f0 is None:
 			print(prompt_msg, file=sys.stderr, flush=True)
-			return None
+			raise gr.Error(f"Prompt preprocessing failed: {prompt_msg or 'No usable audio/pitch output.'}")
 
 		target_ok, target_msg, target_wav, target_f0 = get_app_state().run_preprocess(
 			audio_path=target_raw,
@@ -319,7 +341,7 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		)
 		if not target_ok or target_wav is None or target_f0 is None:
 			print(target_msg, file=sys.stderr, flush=True)
-			return None
+			raise gr.Error(f"Target preprocessing failed: {target_msg or 'No usable audio/pitch output.'}")
 
 		ok, msg, generated = get_app_state().run_svc(
 			prompt_wav_path=prompt_wav,
@@ -336,13 +358,13 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		)
 		if not ok or generated is None:
 			print(msg, file=sys.stderr, flush=True)
-			return None
+			raise gr.Error(f"SVC generation failed: {msg or 'No generated audio was returned.'}")
 		return str(generated)
 	except gr.Error:
 		raise
-	except Exception:
+	except Exception as e:
 		_print_exception("_start_svc")
-		return None
+		raise gr.Error(f"SVC failed: {type(e).__name__}: {e!r}") from e
 
 
 def _header_html(title: str, subtitle: str) -> str:
