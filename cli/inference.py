@@ -56,6 +56,11 @@ def build_model(
     model.eval()
     model.to(device)
     print("Model checkpoint loaded.")
+    print("Compiling diff_estimator with torch.compile (mode=reduce-overhead)...")
+    model.cfm_decoder.model.diff_estimator = torch.compile(
+        model.cfm_decoder.model.diff_estimator, mode="reduce-overhead"
+    )
+    print("diff_estimator compiled.")
 
     return model
 

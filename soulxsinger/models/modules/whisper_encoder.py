@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -11,6 +13,8 @@ from transformers import WhisperFeatureExtractor, WhisperModel
 
 WHISPER_MEL_FRAMES = 3000        # 3000 frames at 16000 Hz
 
+_WHISPER_LOCAL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "pretrained_models" / "whisper-base"
+
 
 class WhisperEncoder():
 
@@ -18,8 +22,9 @@ class WhisperEncoder():
         self,
         device: Optional[str] = None,
     ) -> None:
-        self.fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-base")
-        self.model = WhisperModel.from_pretrained("openai/whisper-base")
+        local = str(_WHISPER_LOCAL_DIR) if _WHISPER_LOCAL_DIR.exists() else "openai/whisper-base"
+        self.fe = WhisperFeatureExtractor.from_pretrained(local, local_files_only=_WHISPER_LOCAL_DIR.exists())
+        self.model = WhisperModel.from_pretrained(local, local_files_only=_WHISPER_LOCAL_DIR.exists())
         self.model = self.model.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     def encode(

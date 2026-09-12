@@ -2,7 +2,10 @@ import os
 import random
 import time
 import yaml
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import numpy as np
 import torch
 import argparse
@@ -440,6 +443,8 @@ def wandb_init(args: argparse.Namespace, config: Dict, batch_size: int) -> None:
         None
     """
 
+    if wandb is None:
+        return
     if not dist.is_initialized() or dist.get_rank() == 0:
         if args.wandb_offline:
             wandb.init(mode='offline',

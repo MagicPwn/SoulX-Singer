@@ -287,13 +287,13 @@ class FlowMatchingTransformer(nn.Module):
                 z.shape[0], dtype=z.dtype, device=z.device
             )
             flow_pred = self.diff_estimator(xt_input, t, cond, xt_mask)
-            flow_pred = flow_pred[:, prompt_len:, :]
+            flow_pred = flow_pred[:, prompt_len:, :].clone()
 
             # cfg
             if cfg > 0:
                 uncond_flow_pred = self.diff_estimator(
                     xt, t, torch.zeros_like(cond)[:, : xt.shape[1], :], x_mask
-                )
+                ).clone()
                 pos_flow_pred_std = flow_pred.std()
                 flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
                 rescale_flow_pred = (
@@ -345,13 +345,13 @@ class FlowMatchingTransformer(nn.Module):
                 z.shape[0], dtype=z.dtype, device=z.device
             )
             flow_pred = self.diff_estimator(xt_input, t, cond, xt_mask)
-            flow_pred = flow_pred[:, prompt_len:-prompt_len, :]
+            flow_pred = flow_pred[:, prompt_len:-prompt_len, :].clone()
 
             # cfg
             if cfg > 0:
                 uncond_flow_pred = self.diff_estimator(
                     xt, t, torch.zeros_like(cond)[:, : xt.shape[1], :], x_mask
-                )
+                ).clone()
                 pos_flow_pred_std = flow_pred.std()
                 flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
                 rescale_flow_pred = (

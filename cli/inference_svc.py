@@ -54,6 +54,11 @@ def build_model(
         model.mel.float()
         print("Model converted to FP16 (mel kept in FP32).")
     print("Model checkpoint loaded.")
+    print("Compiling diff_estimator with torch.compile (mode=reduce-overhead)...")
+    model.cfm_decoder.model.diff_estimator = torch.compile(
+        model.cfm_decoder.model.diff_estimator, mode="reduce-overhead"
+    )
+    print("diff_estimator compiled.")
     model.eval()
     model.to(device)
 

@@ -1,3 +1,37 @@
+import asyncio
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+_asyncio_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_asyncio_loop)
+def _handle_asyncio_exc(loop, ctx):
+    exc = ctx.get('exception')
+    if isinstance(exc, ConnectionResetError):
+        return
+    loop.default_exception_handler(ctx)
+_asyncio_loop.set_exception_handler(_handle_asyncio_exc)
+
+# Monkey-patch: Windows pipe transport raises ConnectionResetError during
+# benign cleanup when the client disconnects. Suppress the noise.
+import asyncio.proactor_events
+_orig_call_conn_lost = asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost
+def _patched_call_conn_lost(self, exc):
+    try:
+        _orig_call_conn_lost(self, exc)
+    except ConnectionResetError:
+        pass
+asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = _patched_call_conn_lost
+
+# Monkey-patch h11: some local proxies close connections mid-response,
+# causing a Content-Length mismatch. Suppress the protocol error since the client is
+# already gone and the connection will be torn down anyway.
+import h11._writers
+_orig_send_eom = h11._writers.ContentLengthWriter.send_eom
+def _patched_send_eom(self, headers, write):
+    try:
+        _orig_send_eom(self, headers, write)
+    except h11._util.LocalProtocolError:
+        pass
+h11._writers.ContentLengthWriter.send_eom = _patched_send_eom
+
 import os
 import random
 import shutil
@@ -12,6 +46,7 @@ import numpy as np
 import torch
 import librosa
 import soundfile as sf
+
 import gradio as gr
 
 from preprocess.pipeline import PreprocessPipeline
@@ -149,8 +184,8 @@ _I18N_KEY2LANG = dict(
         zh="上传 Prompt 与 Target 音频，将自动转录生成 Prompt 与 Target 两份 metadata 文件以及对应的 MIDI 文件。",
     ),
     instruction_p2=dict(
-        en="Auto-transcribed lyrics and notes are often misaligned, which may lead to suboptimal synthesis results. For best results, import the generated MIDI into the [SoulX-Singer-Midi-Editor](https://huggingface.co/spaces/Soul-AILab/SoulX-Singer-Midi-Editor) for manual adjustment. After adjustment, re-upload the MIDI file and the metadata will be automatically updated.",
-        zh="自动转录的歌词与音高对齐效果通常不理想，可能导致合成效果不佳，建议将生成的 MIDI 文件导入 [SoulX-Singer-Midi-Editor](https://huggingface.co/spaces/Soul-AILab/SoulX-Singer-Midi-Editor) 进行手动调整，调整后的 MIDI 文件重新上传后，metadata 将会自动更新。",
+        en="Auto-transcribed lyrics and notes are often misaligned, which may lead to suboptimal synthesis results. For best results, import the generated MIDI into the bundled local MIDI Editor (run 启动_MIDI编辑器.bat) for manual adjustment. After adjustment, re-upload the MIDI file and the metadata will be automatically updated.",
+        zh="自动转录的歌词与音高对齐效果通常不理想，可能导致合成效果不佳，建议将生成的 MIDI 文件导入本地 MIDI 编辑器（双击「启动_MIDI编辑器.bat」）进行手动调整，调整后的 MIDI 文件重新上传后，metadata 将会自动更新。",
     ),
     instruction_p3=dict(
         en="Once prompt audio, prompt metadata, and target metadata are all set, click **🎤Generate singing voice** to run the singing synthesis and generate the final merged audio.",
@@ -574,31 +609,62 @@ def _instruction_md() -> str:
     ])
 
 
+def _header_html(title: str, subtitle: str) -> str:
+    """Branded header: gradient title, subtitle, divider, author + link bar."""
+    link_base = (
+        "text-decoration:none; padding:0.4rem 1rem; border-radius:999px; "
+        "font-weight:600; font-size:0.9rem; line-height:1; "
+        "display:inline-flex; align-items:center; gap:0.4rem; "
+        "transition:transform .15s ease, box-shadow .15s ease;"
+    )
+    tools_style = (
+        link_base
+        + "color:#ffffff; background:linear-gradient(90deg, #6366f1, #8b5cf6); "
+        "box-shadow:0 2px 8px rgba(99,102,241,0.35);"
+    )
+    tutorial_style = (
+        link_base
+        + "color:#6366f1; background:#ffffff; border:1.5px solid #c7d2fe;"
+    )
+    return f"""
+    <div style="text-align:center; padding:1.5rem 0 0.5rem; margin-bottom:0.5rem;">
+      <div style="display:inline-block; font-size:2rem; font-weight:800; letter-spacing:0.02em;
+           line-height:1.3; background:linear-gradient(90deg, #6366f1, #a855f7);
+           -webkit-background-clip:text; background-clip:text;
+           -webkit-text-fill-color:transparent;">{title}</div>
+      <div style="margin-top:0.45rem; font-size:0.95rem; color:#6b7280; letter-spacing:0.08em;">{subtitle}</div>
+      <div style="width:90px; height:3px; margin:1rem auto 0.85rem;
+           background:linear-gradient(90deg, transparent, #8b5cf6, transparent); border-radius:2px;"></div>
+      <div style="display:flex; align-items:center; justify-content:center; gap:0.7rem; flex-wrap:wrap;
+           font-size:0.9rem; color:#4b5563;">
+        <span style="display:inline-flex; align-items:center; gap:0.4rem;">
+          <span style="opacity:0.7;">整合包制作</span>
+          <span style="font-weight:700; color:#6366f1;">王知风</span>
+        </span>
+        <a href="https://wangzhifeng.vip/" target="_blank" rel="noopener" style="{tools_style}">🔧 更多AI工具</a>
+        <a href="https://wangzhifeng.vip/" target="_blank" rel="noopener" style="{tutorial_style}">📖 详细教程</a>
+      </div>
+    </div>
+    """
+
+
 def render_interface() -> gr.Blocks:
-    with gr.Blocks(title="SoulX-Singer 歌声合成Demo", theme=gr.themes.Default()) as page:
-        gr.HTML(
-            '<div style="'
-            'text-align: center; '
-            'padding: 1.25rem 0 1.5rem; '
-            'margin-bottom: 0.5rem;'
-            '">'
-            '<div style="'
-            'display: inline-block; '
-            'font-size: 1.75rem; '
-            'font-weight: 700; '
-            'letter-spacing: 0.02em; '
-            'color: #1a1a2e; '
-            'line-height: 1.3;'
-            '">SoulX-Singer</div>'
-            '<div style="'
-            'width: 80px; '
-            'height: 3px; '
-            'margin: 1rem auto 0; '
-            'background: linear-gradient(90deg, transparent, #6366f1, transparent); '
-            'border-radius: 2px;'
-            '"></div>'
-            '</div>'
-        )
+    theme = gr.themes.Soft(
+        primary_hue=gr.themes.colors.indigo,
+        secondary_hue=gr.themes.colors.violet,
+        neutral_hue=gr.themes.colors.slate,
+        font=["system-ui", "-apple-system", "Microsoft YaHei", "sans-serif"],
+    ).set(
+        body_background_fill="#f7f8fc",
+        block_background_fill="#ffffff",
+        block_border_width="1px",
+        block_shadow="0 1px 3px rgba(17, 24, 39, 0.04)",
+        button_primary_background_fill="linear-gradient(90deg, #6366f1, #8b5cf6)",
+        button_primary_background_fill_hover="linear-gradient(90deg, #4f46e5, #7c3aed)",
+        button_primary_text_color="#ffffff",
+    )
+    with gr.Blocks(title="SoulX-Singer 歌声合成Demo", theme=theme) as page:
+        gr.HTML(_header_html("SoulX-Singer", "AI 歌声合成 · Singing Voice Synthesis"))
         with gr.Row(equal_height=True):
             lang_choice = gr.Radio(
                 choices=["中文", "English"],
@@ -880,12 +946,37 @@ def render_interface() -> gr.Blocks:
 
 if __name__ == "__main__":
     import argparse
+    import os
+
+    # Clear proxy for local Gradio health checks
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(var, None)
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=7860, help="Gradio server port")
+    parser.add_argument("--port", type=int, default=0, help="Gradio server port (0 = auto)")
     parser.add_argument("--share", action="store_true", help="Create public link")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 for SVS model and inference")
     args = parser.parse_args()
 
+    # Auto-find free port if not specified
+    if args.port == 0:
+        import socket as _socket
+        for _port in range(17860, 17960):
+            _s = _socket.socket()
+            _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                _s.bind(("127.0.0.1", _port))
+                _s.close()
+                args.port = _port
+                break
+            except OSError:
+                _s.close()
+        if args.port == 0:
+            raise RuntimeError("No free port found in range 17860-17959")
+
     page = render_interface()
     page.queue()
-    page.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
+    print(f"SoulX-Singer WebUI: http://127.0.0.1:{args.port}")
+    page.launch(share=args.share, server_name="127.0.0.1", server_port=args.port, inbrowser=True)

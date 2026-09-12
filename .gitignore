@@ -40,3 +40,18 @@ deploy/
 # midi editor
 node_modules/
 dist/
+
+# Local portable runtimes, caches, and backups
+/_internal/python/
+/_internal/nodejs/
+/_internal/ffmpeg/
+/_internal/tools/
+/_internal/nltk_data/
+/_internal/code_backup/
+/_internal/pip_freeze_backup.txt
+/_data/
+
+# Local credentials
+.env
+.env.*
+!.env.example
