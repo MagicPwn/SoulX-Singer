@@ -1,37 +1,3 @@
-import asyncio
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-_asyncio_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_asyncio_loop)
-def _handle_asyncio_exc(loop, ctx):
-    exc = ctx.get('exception')
-    if isinstance(exc, ConnectionResetError):
-        return
-    loop.default_exception_handler(ctx)
-_asyncio_loop.set_exception_handler(_handle_asyncio_exc)
-
-# Monkey-patch: Windows pipe transport raises ConnectionResetError during
-# benign cleanup when the client disconnects. Suppress the noise.
-import asyncio.proactor_events
-_orig_call_conn_lost = asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost
-def _patched_call_conn_lost(self, exc):
-    try:
-        _orig_call_conn_lost(self, exc)
-    except ConnectionResetError:
-        pass
-asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = _patched_call_conn_lost
-
-# Monkey-patch h11: some local proxies close connections mid-response,
-# causing a Content-Length mismatch. Suppress the protocol error since the client is
-# already gone and the connection will be torn down anyway.
-import h11._writers
-_orig_send_eom = h11._writers.ContentLengthWriter.send_eom
-def _patched_send_eom(self, headers, write):
-    try:
-        _orig_send_eom(self, headers, write)
-    except h11._util.LocalProtocolError:
-        pass
-h11._writers.ContentLengthWriter.send_eom = _patched_send_eom
-
 import os
 import random
 import shutil
@@ -49,10 +15,9 @@ import soundfile as sf
 
 import gradio as gr
 
-from preprocess.pipeline import PreprocessPipeline
-from preprocess.tools.midi_parser import MidiParser
-from soulxsinger.utils.file_utils import load_config
-from cli.inference import build_model as build_svs_model, process as svs_process
+from threading import Lock
+from longform.ui import GPU_EVENT, WORKSPACE_CSS, render_workspace
+from longform.service import register_legacy_release
 
 
 ROOT = Path(__file__).parent
@@ -144,8 +109,8 @@ _I18N_KEY2LANG = dict(
     section_transcriptions=dict(en="Transcriptions & Metadata", zh="转录与元数据"),
     section_synthesis=dict(en="Singing Synthesis", zh="歌声合成"),
     seed_label=dict(en="Seed", zh="种子"),
-    prompt_audio_label=dict(en=f"Prompt audio (reference voice), limit to {PROMPT_MAX_SEC_DEFAULT} seconds", zh=f"Prompt 音频（参考音色），限制在 {PROMPT_MAX_SEC_DEFAULT} 秒以内"),
-    target_audio_label=dict(en=f"Target audio (melody / lyrics source), limit to {TARGET_MAX_SEC_DEFAULT} seconds", zh=f"Target 音频（旋律/歌词来源），限制在 {TARGET_MAX_SEC_DEFAULT} 秒以内"),
+    prompt_audio_label=dict(en=f"Reference voice crop (first {PROMPT_MAX_SEC_DEFAULT}s, not the target song)", zh=f"参考音色短采样（取前 {PROMPT_MAX_SEC_DEFAULT} 秒，不是目标整曲）"),
+    target_audio_label=dict(en=f"Target clip ≤ {TARGET_MAX_SEC_DEFAULT}s; use Full-song workspace for longer songs", zh=f"目标短片段 ≤ {TARGET_MAX_SEC_DEFAULT} 秒；长歌请用「整曲工作台」"),
     transcription_btn_label=dict(en="Run singing transcription", zh="开始歌声转录"),
     synthesis_btn_label=dict(en="🎤Generate singing voice", zh="🎤歌声合成"),
     prompt_meta_label=dict(en="Prompt metadata", zh="Prompt 元数据"),
@@ -218,7 +183,7 @@ def _load_example(choice_value):
 
     idx = 0
     if isinstance(choice_value, int):
-        idx = 0 if choice_value <= 0 else min(choice_value - 1, len(EXAMPLES_LIST) - 1)
+        idx = 0 if choice_value <= 0 else min(choice_value, len(EXAMPLES_LIST))
     else:
         idx = choice_to_index.get(choice_value, 0)
 
@@ -286,12 +251,19 @@ def _normalize_audio_input(audio):
     return audio[0] if isinstance(audio, tuple) else audio
 
 
-def _trim_and_save_audio(src_audio_path: str, dst_wav_path: Path, max_sec: int, sr: int = SAMPLE_RATE) -> None:
-    """Load audio as mono, trim to max_sec, and save as wav for preprocess."""
+def _trim_and_save_audio(src_audio_path: str, dst_wav_path: Path, max_sec: int,
+                         sr: int = SAMPLE_RATE, allow_trim: bool = True) -> None:
+    """Only reference crops may be trimmed; native targets fail visibly if too long."""
     audio_data, _ = librosa.load(src_audio_path, sr=sr, mono=True)
-    audio_data = audio_data[: max_sec * sr]
+    if not allow_trim and len(audio_data) > int(max_sec * sr):
+        raise gr.Error(
+            f"目标音频超过 {max_sec} 秒，请使用「整曲工作台」处理完整歌曲；未截短音频。 / "
+            f"Target exceeds {max_sec}s. Use the full-song workspace; no audio was cropped."
+        )
+    if allow_trim:
+        audio_data = audio_data[:int(max_sec * sr)]
+    dst_wav_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(dst_wav_path, audio_data, sr)
-
 
 def _yes_no_to_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -309,6 +281,11 @@ def _control_to_internal(control: str) -> str:
 
 class AppState:
     def __init__(self, use_fp16: bool = False) -> None:
+        from preprocess.pipeline import PreprocessPipeline
+        from preprocess.tools.midi_parser import MidiParser
+        from soulxsinger.utils.file_utils import load_config
+        from cli.inference import build_model as build_svs_model
+
         self.device = _get_device()
         self.use_fp16 = use_fp16 and ("cuda" in self.device)
         self.preprocess_pipeline = PreprocessPipeline(
@@ -384,6 +361,7 @@ class AppState:
         args.control = control
         args.use_fp16 = self.use_fp16
         try:
+            from cli.inference import process as svs_process
             svs_process(args, self.svs_config, self.svs_model)
             gc.collect()
             if torch.cuda.is_available():
@@ -430,7 +408,27 @@ class AppState:
         return True, "svs inference done", merged
 
 
-APP_STATE = AppState(use_fp16="--fp16" in sys.argv)
+APP_STATE = None
+_APP_STATE_LOCK = Lock()
+
+
+def release_app_state():
+    """Drop cached legacy models before a serialized long-song operation."""
+    global APP_STATE
+    with _APP_STATE_LOCK:
+        APP_STATE = None
+
+
+register_legacy_release(__name__, release_app_state)
+
+
+def get_app_state():
+    """Load checkpoints only on the first user-initiated model operation."""
+    global APP_STATE
+    with _APP_STATE_LOCK:
+        if APP_STATE is None:
+            APP_STATE = AppState(use_fp16="--fp16" in sys.argv)
+    return APP_STATE
 
 def _edit_metadata(
     meta,
@@ -448,7 +446,7 @@ def _edit_metadata(
         if not meta:
             meta = str(Path(midi).with_name("metadata.json"))
 
-        APP_STATE.midi_parser.midi2meta(midi, meta, audio, language=language)
+        get_app_state().midi_parser.midi2meta(midi, meta, audio, language=language)
         return meta
     except Exception:
         _print_exception("_edit_metadata")
@@ -478,7 +476,7 @@ def _transcribe_prompt(
             transfer_prompt_path = audio_dir / "prompt.wav"
             _trim_and_save_audio(prompt_audio, transfer_prompt_path, prompt_max_sec)
 
-            prompt_ok, prompt_msg = APP_STATE.run_preprocess(
+            prompt_ok, prompt_msg = get_app_state().run_preprocess(
                 audio_path=transfer_prompt_path,
                 save_path=session_base / "transcriptions" / "prompt",
                 vocal_sep=_yes_no_to_bool(prompt_vocal_sep, default=False),
@@ -493,7 +491,7 @@ def _transcribe_prompt(
             shutil.copy2(prompt_meta_resolved, prompt_meta_path)
 
         if prompt_meta_path.exists():
-            APP_STATE.midi_parser.meta2midi(prompt_meta_path, prompt_midi_path)
+            get_app_state().midi_parser.meta2midi(prompt_meta_path, prompt_midi_path)
 
         prompt_meta_file = str(prompt_meta_path) if prompt_meta_path.exists() else None
         prompt_midi_file = str(prompt_midi_path) if prompt_midi_path.exists() else None
@@ -525,9 +523,9 @@ def _transcribe_target(
             audio_dir = session_base / "audio"
             audio_dir.mkdir(parents=True, exist_ok=True)
             transfer_target_path = audio_dir / "target.wav"
-            _trim_and_save_audio(target_audio, transfer_target_path, target_max_sec)
+            _trim_and_save_audio(target_audio, transfer_target_path, target_max_sec, allow_trim=False)
 
-            target_ok, target_msg = APP_STATE.run_preprocess(
+            target_ok, target_msg = get_app_state().run_preprocess(
                 audio_path=transfer_target_path,
                 save_path=session_base / "transcriptions" / "target",
                 vocal_sep=_yes_no_to_bool(target_vocal_sep, default=True),
@@ -542,12 +540,14 @@ def _transcribe_target(
             shutil.copy2(target_meta_resolved, target_meta_path)
 
         if target_meta_path.exists():
-            APP_STATE.midi_parser.meta2midi(target_meta_path, target_midi_path)
+            get_app_state().midi_parser.meta2midi(target_meta_path, target_midi_path)
 
         target_meta_file = str(target_meta_path) if target_meta_path.exists() else None
         target_midi_file = str(target_midi_path) if target_midi_path.exists() else None
         target_vocal_file = str(target_vocal_path) if target_vocal_path.exists() else None
         return target_meta_file, target_midi_file, target_vocal_file
+    except gr.Error:
+        raise
     except Exception:
         _print_exception("_transcribe_target")
         return None, None, None
@@ -583,7 +583,7 @@ def _run_synthesis(
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
-        ok, msg, merged = APP_STATE.run_svs_from_paths(
+        ok, msg, merged = get_app_state().run_svs_from_paths(
             prompt_wav_path=prompt_wav_path,
             prompt_metadata_path=prompt_meta_path,
             target_metadata_path=target_meta_path,
@@ -627,7 +627,7 @@ def _header_html(title: str, subtitle: str) -> str:
         + "color:#6366f1; background:#ffffff; border:1.5px solid #c7d2fe;"
     )
     return f"""
-    <div style="text-align:center; padding:1.5rem 0 0.5rem; margin-bottom:0.5rem;">
+    <div class="brand-header" style="text-align:center; padding:1.5rem 0 0.5rem; margin-bottom:0.5rem;">
       <div style="display:inline-block; font-size:2rem; font-weight:800; letter-spacing:0.02em;
            line-height:1.3; background:linear-gradient(90deg, #6366f1, #a855f7);
            -webkit-background-clip:text; background-clip:text;
@@ -663,7 +663,7 @@ def render_interface() -> gr.Blocks:
         button_primary_background_fill_hover="linear-gradient(90deg, #4f46e5, #7c3aed)",
         button_primary_text_color="#ffffff",
     )
-    with gr.Blocks(title="SoulX-Singer 歌声合成Demo", theme=theme) as page:
+    with gr.Blocks(title="SoulX-Singer 歌声合成Demo", analytics_enabled=False) as page:
         gr.HTML(_header_html("SoulX-Singer", "AI 歌声合成 · Singing Voice Synthesis"))
         with gr.Row(equal_height=True):
             lang_choice = gr.Radio(
@@ -675,272 +675,282 @@ def render_interface() -> gr.Blocks:
                 elem_id="lang_choice_radio",
             )
 
-        # Instruction panel (usage workflow); updates on language change
-        instruction_md = gr.Markdown(f"### {_i18n('instruction_title')}\n\n{_instruction_md()}")
+        with gr.Tabs(selected="long", elem_id="workflow-tabs"):
+            with gr.Tab("整曲工作台", id="long"):
+                render_workspace(ROOT, mode="svs")
+            with gr.Tab("短片段 / MIDI 高级模式", id="advanced"):
+                # Instruction panel (usage workflow); updates on language change
+                instruction_md = gr.Markdown(f"### {_i18n('instruction_title')}\n\n{_instruction_md()}")
 
-        # Reference examples — at the front of operations (handler registered after components exist)
-        skip_clear_metadata_count = gr.State(0)
-        with gr.Row():
-            _example_choices = [_i18n("example_choice_0"), _i18n("example_choice_1"), _i18n("example_choice_2"), _i18n("example_choice_3"), _i18n("example_choice_4")]
-            example_choice = gr.Dropdown(
-                label=_i18n("examples_label"),
-                choices=_example_choices,
-                value=_example_choices[0],
-                interactive=True,
-            )
-
-        # Step 1: Transcription (audio → metadata)
-        with gr.Accordion(_i18n("section_input_audio"), open=True) as accordion_input_audio:
-            with gr.Row(equal_height=True):
-                with gr.Column(scale=1):
-                    prompt_audio = gr.Audio(
-                        label=_i18n("prompt_audio_label"),
-                        type="filepath",
-                        editable=False,
+                # Reference examples — at the front of operations (handler registered after components exist)
+                skip_clear_metadata_count = gr.State(0)
+                with gr.Row():
+                    _example_choices = [_i18n("example_choice_0"), _i18n("example_choice_1"), _i18n("example_choice_2"), _i18n("example_choice_3"), _i18n("example_choice_4")]
+                    example_choice = gr.Dropdown(
+                        label=_i18n("examples_label"),
+                        choices=_example_choices,
+                        value=_example_choices[0],
                         interactive=True,
                     )
-                with gr.Column(scale=1):
-                    target_audio = gr.Audio(
-                        label=_i18n("target_audio_label"),
-                        type="filepath",
-                        editable=False,
-                        interactive=True,
-                    )
-        with gr.Accordion(_i18n("section_transcriptions"), open=True) as accordion_transcriptions:
-            with gr.Row(equal_height=True):
-                prompt_lyric_lang = gr.Dropdown(
-                    label=_i18n("prompt_lyric_lang_label"),
-                    choices=_get_lyric_lang_choices(),
-                    value="Mandarin",
-                    interactive=True,
-                    scale=1,
-                )
-                prompt_vocal_sep = gr.Dropdown(
-                    label=_i18n("prompt_vocal_sep_label"),
-                    choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
-                    value="no",
-                    interactive=True,
-                    scale=1,
-                )
-                target_lyric_lang = gr.Dropdown(
-                    label=_i18n("target_lyric_lang_label"),
-                    choices=_get_lyric_lang_choices(),
-                    value="Mandarin",
-                    interactive=True,
-                    scale=1,
-                )
-                target_vocal_sep = gr.Dropdown(
-                    label=_i18n("target_vocal_sep_label"),
-                    choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
-                    value="yes",
-                    interactive=True,
-                    scale=1,
+
+                # Step 1: Transcription (audio → metadata)
+                with gr.Accordion(_i18n("section_input_audio"), open=True) as accordion_input_audio:
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1):
+                            prompt_audio = gr.Audio(
+                                label=_i18n("prompt_audio_label"),
+                                type="filepath",
+                                editable=False,
+                                interactive=True,
+                            )
+                        with gr.Column(scale=1):
+                            target_audio = gr.Audio(
+                                label=_i18n("target_audio_label"),
+                                type="filepath",
+                                editable=False,
+                                interactive=True,
+                            )
+                with gr.Accordion(_i18n("section_transcriptions"), open=True) as accordion_transcriptions:
+                    with gr.Row(equal_height=True):
+                        prompt_lyric_lang = gr.Dropdown(
+                            label=_i18n("prompt_lyric_lang_label"),
+                            choices=_get_lyric_lang_choices(),
+                            value="Mandarin",
+                            interactive=True,
+                            scale=1,
+                        )
+                        prompt_vocal_sep = gr.Dropdown(
+                            label=_i18n("prompt_vocal_sep_label"),
+                            choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
+                            value="no",
+                            interactive=True,
+                            scale=1,
+                        )
+                        target_lyric_lang = gr.Dropdown(
+                            label=_i18n("target_lyric_lang_label"),
+                            choices=_get_lyric_lang_choices(),
+                            value="Mandarin",
+                            interactive=True,
+                            scale=1,
+                        )
+                        target_vocal_sep = gr.Dropdown(
+                            label=_i18n("target_vocal_sep_label"),
+                            choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
+                            value="yes",
+                            interactive=True,
+                            scale=1,
+                        )
+
+                    with gr.Row(equal_height=True):
+                        prompt_metadata = gr.File(
+                            label=_i18n("prompt_meta_label"),
+                            type="filepath",
+                            file_types=[".json"],
+                            height=140,
+                            interactive=True,
+                        )
+                        prompt_midi = gr.File(
+                            label=_i18n("prompt_midi_label"),
+                            type="filepath",
+                            file_types=[".midi", ".mid"],
+                            height=140,
+                            interactive=True,
+                        )
+                        target_metadata = gr.File(
+                            label=_i18n("target_meta_label"),
+                            type="filepath",
+                            file_types=[".json"],
+                            height=140,
+                            interactive=True,
+                        )
+                        target_midi = gr.File(
+                            label=_i18n("target_midi_label"),
+                            type="filepath",
+                            file_types=[".midi", ".mid"],
+                            height=140,
+                            interactive=True,
+                        )
+                        target_vocal = gr.File(
+                            type="filepath",
+                            file_types=[".wav"],
+                            interactive=False,
+                            visible=False,
+                        )
+                with gr.Accordion(_i18n("section_synthesis"), open=True) as accordion_synthesis:
+                    with gr.Row(equal_height=True):
+                        control_radio = gr.Dropdown(
+                            choices=[(_i18n("control_melody"), "melody-controlled"), (_i18n("control_score"), "score-controlled")],
+                            value="score-controlled",
+                            label=_i18n("control_type_label"),
+                            scale=1,
+                        )
+                        auto_shift = gr.Dropdown(
+                            label=_i18n("auto_shift_label"),
+                            choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
+                            value="yes",
+                            interactive=True,
+                            scale=1,
+                        )
+                        pitch_shift = gr.Number(
+                            label=_i18n("pitch_shift_label"),
+                            value=0,
+                            minimum=-36,
+                            maximum=36,
+                            step=1,
+                            interactive=True,
+                            scale=1,
+                        )
+                        seed_input = gr.Number(
+                            label=_i18n("seed_label"),
+                            value=12306,
+                            step=1,
+                            interactive=True,
+                            scale=1,
+                        )
+                    with gr.Row():
+                        synthesis_btn = gr.Button(
+                            value=_i18n("synthesis_btn_label"),
+                            variant="primary",
+                            size="lg",
+                        )
+                    with gr.Row():
+                        output_audio = gr.Audio(
+                            label=_i18n("generated_audio_label"),
+                            type="filepath",
+                            interactive=False,
+                        )
+
+                example_choice.change(
+                    fn=_load_example,
+                    inputs=[example_choice],
+                    outputs=[
+                        prompt_audio,
+                        target_audio,
+                        prompt_metadata,
+                        target_metadata,
+                        prompt_lyric_lang,
+                        target_lyric_lang,
+                        control_radio,
+                        prompt_vocal_sep,
+                        target_vocal_sep,
+                        auto_shift,
+                        pitch_shift,
+                        skip_clear_metadata_count,
+                    ],
                 )
 
-            with gr.Row(equal_height=True):
-                prompt_metadata = gr.File(
-                    label=_i18n("prompt_meta_label"),
-                    type="filepath",
-                    file_types=[".json"],
-                    height=140,
-                    interactive=True,
-                )
-                prompt_midi = gr.File(
-                    label=_i18n("prompt_midi_label"),
-                    type="filepath",
-                    file_types=[".midi", ".mid"],
-                    height=140,
-                    interactive=True,
-                )
-                target_metadata = gr.File(
-                    label=_i18n("target_meta_label"),
-                    type="filepath",
-                    file_types=[".json"],
-                    height=140,
-                    interactive=True,
-                )
-                target_midi = gr.File(
-                    label=_i18n("target_midi_label"),
-                    type="filepath",
-                    file_types=[".midi", ".mid"],
-                    height=140,
-                    interactive=True,
-                )
-                target_vocal = gr.File(
-                    type="filepath",
-                    file_types=[".wav"],
-                    interactive=False,
-                    visible=False,
-                )
-        with gr.Accordion(_i18n("section_synthesis"), open=True) as accordion_synthesis:
-            with gr.Row(equal_height=True):
-                control_radio = gr.Dropdown(
-                    choices=[(_i18n("control_melody"), "melody-controlled"), (_i18n("control_score"), "score-controlled")],
-                    value="score-controlled",
-                    label=_i18n("control_type_label"),
-                    scale=1,
-                )
-                auto_shift = gr.Dropdown(
-                    label=_i18n("auto_shift_label"),
-                    choices=[(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")],
-                    value="yes",
-                    interactive=True,
-                    scale=1,
-                )
-                pitch_shift = gr.Number(
-                    label=_i18n("pitch_shift_label"),
-                    value=0,
-                    minimum=-36,
-                    maximum=36,
-                    step=1,
-                    interactive=True,
-                    scale=1,
-                )
-                seed_input = gr.Number(
-                    label=_i18n("seed_label"),
-                    value=12306,
-                    step=1,
-                    interactive=True,
-                    scale=1,
-                )
-            with gr.Row():
-                synthesis_btn = gr.Button(
-                    value=_i18n("synthesis_btn_label"),
-                    variant="primary",
-                    size="lg",
-                )
-            with gr.Row():
-                output_audio = gr.Audio(
-                    label=_i18n("generated_audio_label"),
-                    type="filepath",
-                    interactive=False,
+                def _change_component_language(lang):
+                    global _GLOBAL_LANG
+                    _GLOBAL_LANG = ["zh", "en"][lang]
+                    lyric_choices = _get_lyric_lang_choices()
+                    yes_no_choices = [(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")]
+                    control_choices = [(_i18n("control_melody"), "melody-controlled"), (_i18n("control_score"), "score-controlled")]
+                    return [
+                        gr.update(label=_i18n("prompt_audio_label")),
+                        gr.update(label=_i18n("target_audio_label")),
+                        gr.update(label=_i18n("prompt_lyric_lang_label"), choices=lyric_choices),
+                        gr.update(label=_i18n("target_lyric_lang_label"), choices=lyric_choices),
+                        gr.update(label=_i18n("prompt_vocal_sep_label"), choices=yes_no_choices),
+                        gr.update(label=_i18n("target_vocal_sep_label"), choices=yes_no_choices),
+                        gr.update(label=_i18n("prompt_meta_label")),
+                        gr.update(label=_i18n("target_meta_label")),
+                        gr.update(label=_i18n("control_type_label"), choices=control_choices),
+                        gr.update(label=_i18n("auto_shift_label"), choices=yes_no_choices),
+                        gr.update(label=_i18n("pitch_shift_label")),
+                        gr.update(label=_i18n("seed_label")),
+                        gr.update(value=_i18n("synthesis_btn_label")),
+                        gr.update(label=_i18n("generated_audio_label")),
+                        gr.update(label=_i18n("display_lang_label")),
+                        gr.update(
+                            label=_i18n("examples_label"),
+                            choices=[_i18n("example_choice_0"), _i18n("example_choice_1"), _i18n("example_choice_2"), _i18n("example_choice_3"), _i18n("example_choice_4")],
+                            value=_i18n("example_choice_0"),
+                        ),
+                        gr.update(value=f"### {_i18n('instruction_title')}\n\n{_instruction_md()}"),
+                        gr.update(label=_i18n("section_input_audio")),
+                        gr.update(label=_i18n("section_transcriptions")),
+                        gr.update(label=_i18n("section_synthesis")),
+                    ]
+
+                lang_choice.change(
+                    fn=_change_component_language,
+                    inputs=[lang_choice],
+                    outputs=[
+                        prompt_audio,
+                        target_audio,
+                        prompt_lyric_lang,
+                        target_lyric_lang,
+                        prompt_vocal_sep,
+                        target_vocal_sep,
+                        prompt_metadata,
+                        target_metadata,
+                        control_radio,
+                        auto_shift,
+                        pitch_shift,
+                        seed_input,
+                        synthesis_btn,
+                        output_audio,
+                        lang_choice,
+                        example_choice,
+                        instruction_md,
+                        accordion_input_audio,
+                        accordion_transcriptions,
+                        accordion_synthesis,
+                    ],
                 )
 
-        example_choice.change(
-            fn=_load_example,
-            inputs=[example_choice],
-            outputs=[
-                prompt_audio,
-                target_audio,
-                prompt_metadata,
-                target_metadata,
-                prompt_lyric_lang,
-                target_lyric_lang,
-                control_radio,
-                prompt_vocal_sep,
-                target_vocal_sep,
-                auto_shift,
-                pitch_shift,
-                skip_clear_metadata_count,
-            ],
-        )
+                # Upload new prompt/target audio → clear corresponding metadata; skip clear when change came from load example
+                prompt_audio.change(
+                    fn=_clear_prompt_meta_unless_example,
+                    inputs=[prompt_audio, skip_clear_metadata_count],
+                    outputs=[prompt_metadata, skip_clear_metadata_count],
+                )
+                prompt_audio.upload(
+                    fn=_transcribe_prompt,
+                    **GPU_EVENT,
+                    inputs=[prompt_audio, prompt_metadata, prompt_lyric_lang, prompt_vocal_sep],
+                    outputs=[prompt_metadata, prompt_midi],
+                )
+                prompt_midi.upload(
+                    fn=_edit_metadata,
+                    **GPU_EVENT,
+                    inputs=[prompt_metadata, prompt_midi, prompt_audio, prompt_lyric_lang],
+                    outputs=[prompt_metadata],
+                )
+                target_audio.change(
+                    fn=_clear_target_meta_unless_example,
+                    inputs=[target_audio, skip_clear_metadata_count],
+                    outputs=[target_metadata, skip_clear_metadata_count],
+                )
+                target_audio.upload(
+                    fn=_transcribe_target,
+                    **GPU_EVENT,
+                    inputs=[target_audio, target_metadata, target_lyric_lang, target_vocal_sep],
+                    outputs=[target_metadata, target_midi, target_vocal],
+                )
+                target_midi.upload(
+                    fn=_edit_metadata,
+                    **GPU_EVENT,
+                    inputs=[target_metadata, target_midi, target_vocal, target_lyric_lang],
+                    outputs=[target_metadata],
+                )
 
-        def _change_component_language(lang):
-            global _GLOBAL_LANG
-            _GLOBAL_LANG = ["zh", "en"][lang]
-            lyric_choices = _get_lyric_lang_choices()
-            yes_no_choices = [(_i18n("option_yes"), "yes"), (_i18n("option_no"), "no")]
-            control_choices = [(_i18n("control_melody"), "melody-controlled"), (_i18n("control_score"), "score-controlled")]
-            return [
-                gr.update(label=_i18n("prompt_audio_label")),
-                gr.update(label=_i18n("target_audio_label")),
-                gr.update(label=_i18n("prompt_lyric_lang_label"), choices=lyric_choices),
-                gr.update(label=_i18n("target_lyric_lang_label"), choices=lyric_choices),
-                gr.update(label=_i18n("prompt_vocal_sep_label"), choices=yes_no_choices),
-                gr.update(label=_i18n("target_vocal_sep_label"), choices=yes_no_choices),
-                gr.update(label=_i18n("prompt_meta_label")),
-                gr.update(label=_i18n("target_meta_label")),
-                gr.update(label=_i18n("control_type_label"), choices=control_choices),
-                gr.update(label=_i18n("auto_shift_label"), choices=yes_no_choices),
-                gr.update(label=_i18n("pitch_shift_label")),
-                gr.update(label=_i18n("seed_label")),
-                gr.update(value=_i18n("synthesis_btn_label")),
-                gr.update(label=_i18n("generated_audio_label")),
-                gr.update(label=_i18n("display_lang_label")),
-                gr.update(
-                    label=_i18n("examples_label"),
-                    choices=[_i18n("example_choice_0"), _i18n("example_choice_1"), _i18n("example_choice_2"), _i18n("example_choice_3"), _i18n("example_choice_4")],
-                    value=_i18n("example_choice_0"),
-                ),
-                gr.update(value=f"### {_i18n('instruction_title')}\n\n{_instruction_md()}"),
-                gr.update(label=_i18n("section_input_audio")),
-                gr.update(label=_i18n("section_transcriptions")),
-                gr.update(label=_i18n("section_synthesis")),
-            ]
+                synthesis_btn.click(
+                    fn=_run_synthesis,
+                    **GPU_EVENT,
+                    inputs=[
+                        prompt_audio,
+                        prompt_metadata,
+                        target_metadata,
+                        control_radio,
+                        auto_shift,
+                        pitch_shift,
+                        seed_input,
+                    ],
+                    outputs=[output_audio],
+                )
 
-        lang_choice.change(
-            fn=_change_component_language,
-            inputs=[lang_choice],
-            outputs=[
-                prompt_audio,
-                target_audio,
-                prompt_lyric_lang,
-                target_lyric_lang,
-                prompt_vocal_sep,
-                target_vocal_sep,
-                prompt_metadata,
-                target_metadata,
-                control_radio,
-                auto_shift,
-                pitch_shift,
-                seed_input,
-                synthesis_btn,
-                output_audio,
-                lang_choice,
-                example_choice,
-                instruction_md,
-                accordion_input_audio,
-                accordion_transcriptions,
-                accordion_synthesis,
-            ],
-        )
-
-        # Upload new prompt/target audio → clear corresponding metadata; skip clear when change came from load example
-        prompt_audio.change(
-            fn=_clear_prompt_meta_unless_example,
-            inputs=[prompt_audio, skip_clear_metadata_count],
-            outputs=[prompt_metadata, skip_clear_metadata_count],
-        )
-        prompt_audio.upload(
-            fn=_transcribe_prompt,
-            inputs=[prompt_audio, prompt_metadata, prompt_lyric_lang, prompt_vocal_sep],
-            outputs=[prompt_metadata, prompt_midi],
-        )
-        prompt_midi.upload(
-            fn=_edit_metadata,
-            inputs=[prompt_metadata, prompt_midi, prompt_audio, prompt_lyric_lang],
-            outputs=[prompt_metadata],
-        )
-        target_audio.change(
-            fn=_clear_target_meta_unless_example,
-            inputs=[target_audio, skip_clear_metadata_count],
-            outputs=[target_metadata, skip_clear_metadata_count],
-        )
-        target_audio.upload(
-            fn=_transcribe_target,
-            inputs=[target_audio, target_metadata, target_lyric_lang, target_vocal_sep],
-            outputs=[target_metadata, target_midi, target_vocal],
-        )
-        target_midi.upload(
-            fn=_edit_metadata,
-            inputs=[target_metadata, target_midi, target_vocal, target_lyric_lang],
-            outputs=[target_metadata],
-        )
-
-        synthesis_btn.click(
-            fn=_run_synthesis,
-            inputs=[
-                prompt_audio,
-                prompt_metadata,
-                target_metadata,
-                control_radio,
-                auto_shift,
-                pitch_shift,
-                seed_input,
-            ],
-            outputs=[output_audio],
-        )
-
+    page.workspace_theme = theme
     return page
 
 
@@ -958,6 +968,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=0, help="Gradio server port (0 = auto)")
     parser.add_argument("--share", action="store_true", help="Create public link")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 for SVS model and inference")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: local only)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     args = parser.parse_args()
 
     # Auto-find free port if not specified
@@ -967,7 +979,7 @@ if __name__ == "__main__":
             _s = _socket.socket()
             _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
             try:
-                _s.bind(("127.0.0.1", _port))
+                _s.bind((args.host, _port))
                 _s.close()
                 args.port = _port
                 break
@@ -977,6 +989,7 @@ if __name__ == "__main__":
             raise RuntimeError("No free port found in range 17860-17959")
 
     page = render_interface()
-    page.queue()
-    print(f"SoulX-Singer WebUI: http://127.0.0.1:{args.port}")
-    page.launch(share=args.share, server_name="127.0.0.1", server_port=args.port, inbrowser=True)
+    page.queue(default_concurrency_limit=1)
+    print(f"SoulX-Singer WebUI: http://{args.host}:{args.port}")
+    page.launch(share=args.share, server_name=args.host, server_port=args.port, inbrowser=not args.no_browser,
+        theme=page.workspace_theme, css=WORKSPACE_CSS)

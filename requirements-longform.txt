@@ -1,0 +1,2 @@
+# Legacy Word .doc extraction only; TXT/DOCX use Python's standard library.
+olefile==0.47

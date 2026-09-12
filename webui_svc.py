@@ -1,37 +1,3 @@
-import asyncio
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-_asyncio_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_asyncio_loop)
-def _handle_asyncio_exc(loop, ctx):
-    exc = ctx.get('exception')
-    if isinstance(exc, ConnectionResetError):
-        return
-    loop.default_exception_handler(ctx)
-_asyncio_loop.set_exception_handler(_handle_asyncio_exc)
-
-# Monkey-patch: Windows pipe transport raises ConnectionResetError during
-# benign cleanup when the client disconnects. Suppress the noise.
-import asyncio.proactor_events
-_orig_call_conn_lost = asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost
-def _patched_call_conn_lost(self, exc):
-    try:
-        _orig_call_conn_lost(self, exc)
-    except ConnectionResetError:
-        pass
-asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = _patched_call_conn_lost
-
-# Monkey-patch h11: some local proxies close connections mid-response,
-# causing a Content-Length mismatch. Suppress the protocol error since the client is
-# already gone and the connection will be torn down anyway.
-import h11._writers
-_orig_send_eom = h11._writers.ContentLengthWriter.send_eom
-def _patched_send_eom(self, headers, write):
-    try:
-        _orig_send_eom(self, headers, write)
-    except h11._util.LocalProtocolError:
-        pass
-h11._writers.ContentLengthWriter.send_eom = _patched_send_eom
-
 import random
 import sys
 import traceback
@@ -46,9 +12,9 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from preprocess.pipeline import PreprocessPipeline
-from soulxsinger.utils.file_utils import load_config
-from cli.inference_svc import build_model as build_svc_model, process as svc_process
+from threading import Lock
+from longform.ui import GPU_EVENT, WORKSPACE_CSS, render_workspace
+from longform.service import register_legacy_release
 
 
 ROOT = Path(__file__).parent
@@ -75,8 +41,8 @@ EXAMPLE_LIST = [[
 _I18N = dict(
 	display_lang_label=dict(en="Display Language", zh="显示语言"),
 	title=dict(en="## SoulX-Singer SVC", zh="## SoulX-Singer SVC"),
-	prompt_audio_label=dict(en=f"Prompt audio", zh=f"Prompt 音频"),
-	target_audio_label=dict(en=f"Target audio", zh=f"Target 音频"),
+	prompt_audio_label=dict(en=f"Reference voice crop (first {PROMPT_MAX_SEC_DEFAULT}s)", zh=f"参考音色短采样（取前 {PROMPT_MAX_SEC_DEFAULT} 秒）"),
+	target_audio_label=dict(en=f"Native target ≤ {TARGET_MAX_SEC_DEFAULT}s; long songs: use Full-song workspace", zh=f"原生目标 ≤ {TARGET_MAX_SEC_DEFAULT} 秒；分段改词 / 恢复进度请用「整曲工作台」"),
 	prompt_vocal_sep_label=dict(en="Prompt vocal separation", zh="Prompt 人声分离"),
 	target_vocal_sep_label=dict(en="Target vocal separation", zh="Target 人声分离"),
 	auto_shift_label=dict(en="Auto pitch shift", zh="自动变调"),
@@ -141,12 +107,19 @@ def _normalize_audio_input(audio):
 	return audio[0] if isinstance(audio, tuple) else audio
 
 
-def _trim_and_save_audio(src_audio_path: str, dst_wav_path: Path, max_sec: int, sr: int = SAMPLE_RATE) -> None:
-	audio_data, _ = librosa.load(src_audio_path, sr=sr, mono=True)
-	audio_data = audio_data[: max_sec * sr]
-	dst_wav_path.parent.mkdir(parents=True, exist_ok=True)
-	sf.write(dst_wav_path, audio_data, sr)
-
+def _trim_and_save_audio(src_audio_path: str, dst_wav_path: Path, max_sec: int,
+                         sr: int = SAMPLE_RATE, allow_trim: bool = True) -> None:
+    """Only reference crops may be trimmed; native targets fail visibly if too long."""
+    audio_data, _ = librosa.load(src_audio_path, sr=sr, mono=True)
+    if not allow_trim and len(audio_data) > int(max_sec * sr):
+        raise gr.Error(
+            f"目标音频超过 {max_sec} 秒，请使用「整曲工作台」处理完整歌曲；未截短音频。 / "
+            f"Target exceeds {max_sec}s. Use the full-song workspace; no audio was cropped."
+        )
+    if allow_trim:
+        audio_data = audio_data[:int(max_sec * sr)]
+    dst_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(dst_wav_path, audio_data, sr)
 
 def _usage_md() -> str:
 	return "\n\n".join([
@@ -168,6 +141,10 @@ def _tips_md() -> str:
 
 class AppState:
 	def __init__(self, use_fp16: bool = False) -> None:
+		from preprocess.pipeline import PreprocessPipeline
+		from soulxsinger.utils.file_utils import load_config
+		from cli.inference_svc import build_model as build_svc_model
+
 		self.device = _get_device()
 		self.use_fp16 = use_fp16 and ("cuda" in self.device)
 		self.preprocess_pipeline = PreprocessPipeline(
@@ -245,6 +222,7 @@ class AppState:
 			args.cfg = float(cfg)
 			args.use_fp16 = self.use_fp16
 
+			from cli.inference_svc import process as svc_process
 			svc_process(args, self.svc_config, self.svc_model)
 
 			generated = save_dir / "generated.wav"
@@ -269,7 +247,7 @@ class AppState:
 					if acc_shift != 0:
 						acc = librosa.effects.pitch_shift(acc, sr=mix_sr, n_steps=acc_shift)
 						print(f"Applied pitch shift of {acc_shift} semitones to accompaniment to match vocal shift of {vocal_shift} semitones.")
-						
+
 					mix_len = min(len(vocal), len(acc))
 					if mix_len > 0:
 						mixed = vocal[:mix_len] + acc[:mix_len]
@@ -287,7 +265,27 @@ class AppState:
 			return False, f"svc inference failed: {e}", None
 
 
-APP_STATE = AppState(use_fp16="--fp16" in sys.argv)
+APP_STATE = None
+_APP_STATE_LOCK = Lock()
+
+
+def release_app_state():
+    """Drop cached legacy models before a serialized long-song operation."""
+    global APP_STATE
+    with _APP_STATE_LOCK:
+        APP_STATE = None
+
+
+register_legacy_release(__name__, release_app_state)
+
+
+def get_app_state():
+	"""Load checkpoints only on the first user-initiated model operation."""
+	global APP_STATE
+	with _APP_STATE_LOCK:
+		if APP_STATE is None:
+			APP_STATE = AppState(use_fp16="--fp16" in sys.argv)
+	return APP_STATE
 
 
 def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, auto_shift, auto_mix_acc, pitch_shift, n_step, cfg, seed):
@@ -303,9 +301,9 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		prompt_raw = audio_dir / "prompt.wav"
 		target_raw = audio_dir / "target.wav"
 		_trim_and_save_audio(prompt_audio, prompt_raw, PROMPT_MAX_SEC_DEFAULT)
-		_trim_and_save_audio(target_audio, target_raw, TARGET_MAX_SEC_DEFAULT)
+		_trim_and_save_audio(target_audio, target_raw, TARGET_MAX_SEC_DEFAULT, allow_trim=False)
 
-		prompt_ok, prompt_msg, prompt_wav, prompt_f0 = APP_STATE.run_preprocess(
+		prompt_ok, prompt_msg, prompt_wav, prompt_f0 = get_app_state().run_preprocess(
 			audio_path=prompt_raw,
 			save_path=session_base / "transcriptions" / "prompt",
 			vocal_sep=bool(prompt_vocal_sep),
@@ -314,7 +312,7 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 			print(prompt_msg, file=sys.stderr, flush=True)
 			return None
 
-		target_ok, target_msg, target_wav, target_f0 = APP_STATE.run_preprocess(
+		target_ok, target_msg, target_wav, target_f0 = get_app_state().run_preprocess(
 			audio_path=target_raw,
 			save_path=session_base / "transcriptions" / "target",
 			vocal_sep=bool(target_vocal_sep),
@@ -323,7 +321,7 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 			print(target_msg, file=sys.stderr, flush=True)
 			return None
 
-		ok, msg, generated = APP_STATE.run_svc(
+		ok, msg, generated = get_app_state().run_svc(
 			prompt_wav_path=prompt_wav,
 			target_wav_path=target_wav,
 			prompt_f0_path=prompt_f0,
@@ -340,6 +338,8 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 			print(msg, file=sys.stderr, flush=True)
 			return None
 		return str(generated)
+	except gr.Error:
+		raise
 	except Exception:
 		_print_exception("_start_svc")
 		return None
@@ -363,7 +363,7 @@ def _header_html(title: str, subtitle: str) -> str:
 		+ "color:#6366f1; background:#ffffff; border:1.5px solid #c7d2fe;"
 	)
 	return f"""
-	<div style="text-align:center; padding:1.5rem 0 0.5rem; margin-bottom:0.5rem;">
+	<div class="brand-header" style="text-align:center; padding:1.5rem 0 0.5rem; margin-bottom:0.5rem;">
 	  <div style="display:inline-block; font-size:2rem; font-weight:800; letter-spacing:0.02em;
 	       line-height:1.3; background:linear-gradient(90deg, #6366f1, #a855f7);
 	       -webkit-background-clip:text; background-clip:text;
@@ -399,7 +399,7 @@ def render_interface() -> gr.Blocks:
 		button_primary_background_fill_hover="linear-gradient(90deg, #4f46e5, #7c3aed)",
 		button_primary_text_color="#ffffff",
 	)
-	with gr.Blocks(title="SoulX-Singer-SVC Demo", theme=theme) as page:
+	with gr.Blocks(title="SoulX-Singer-SVC Demo", analytics_enabled=False) as page:
 		gr.HTML(_header_html("SoulX-Singer SVC", "AI 歌声转换 · Singing Voice Conversion"))
 		with gr.Row(equal_height=True):
 			lang_choice = gr.Radio(
@@ -410,109 +410,114 @@ def render_interface() -> gr.Blocks:
 				interactive=True,
 			)
 
-		usage_md = gr.Markdown(_usage_md())
+		with gr.Tabs(selected="long", elem_id="workflow-tabs"):
+			with gr.Tab("整曲工作台", id="long"):
+				render_workspace(ROOT, mode="svc")
+			with gr.Tab("原生歌声转换 / SVC 高级模式", id="advanced"):
+				usage_md = gr.Markdown(_usage_md())
 
-		with gr.Row(equal_height=True):
-			prompt_audio = gr.Audio(
-				label=_i18n("prompt_audio_label"),
-				type="filepath",
-				editable=False,
-				interactive=True,
-			)
-			target_audio = gr.Audio(
-				label=_i18n("target_audio_label"),
-				type="filepath",
-				editable=False,
-				interactive=True,
-			)
+				with gr.Row(equal_height=True):
+					prompt_audio = gr.Audio(
+						label=_i18n("prompt_audio_label"),
+						type="filepath",
+						editable=False,
+						interactive=True,
+					)
+					target_audio = gr.Audio(
+						label=_i18n("target_audio_label"),
+						type="filepath",
+						editable=False,
+						interactive=True,
+					)
 
-		with gr.Row(equal_height=True):
-			prompt_vocal_sep = gr.Checkbox(label=_i18n("prompt_vocal_sep_label"), value=False, scale=1)
-			target_vocal_sep = gr.Checkbox(label=_i18n("target_vocal_sep_label"), value=True, scale=1)
-			auto_shift = gr.Checkbox(label=_i18n("auto_shift_label"), value=True, scale=1)
-			auto_mix_acc = gr.Checkbox(label=_i18n("auto_mix_acc_label"), value=True, scale=1)
+				with gr.Row(equal_height=True):
+					prompt_vocal_sep = gr.Checkbox(label=_i18n("prompt_vocal_sep_label"), value=False, scale=1)
+					target_vocal_sep = gr.Checkbox(label=_i18n("target_vocal_sep_label"), value=True, scale=1)
+					auto_shift = gr.Checkbox(label=_i18n("auto_shift_label"), value=True, scale=1)
+					auto_mix_acc = gr.Checkbox(label=_i18n("auto_mix_acc_label"), value=True, scale=1)
 
-		with gr.Row(equal_height=True):
-			pitch_shift = gr.Slider(label=_i18n("pitch_shift_label"), value=0, minimum=-36, maximum=36, step=1, scale=1)
-			n_step = gr.Slider(label=_i18n("n_step_label"), value=32, minimum=1, maximum=200, step=1, scale=1)
-			cfg = gr.Slider(label=_i18n("cfg_label"), value=1.0, minimum=0.0, maximum=10.0, step=0.1, scale=1)
-			seed_input = gr.Slider(label=_i18n("seed_label"), value=42, minimum=0, maximum=10000, step=1, scale=1)
+				with gr.Row(equal_height=True):
+					pitch_shift = gr.Slider(label=_i18n("pitch_shift_label"), value=0, minimum=-36, maximum=36, step=1, scale=1)
+					n_step = gr.Slider(label=_i18n("n_step_label"), value=32, minimum=1, maximum=200, step=1, scale=1)
+					cfg = gr.Slider(label=_i18n("cfg_label"), value=1.0, minimum=0.0, maximum=10.0, step=0.1, scale=1)
+					seed_input = gr.Slider(label=_i18n("seed_label"), value=42, minimum=0, maximum=10000, step=1, scale=1)
 
-		with gr.Row():
-			run_btn = gr.Button(value=_i18n("run_btn"), variant="primary", size="lg")
+				with gr.Row():
+					run_btn = gr.Button(value=_i18n("run_btn"), variant="primary", size="lg")
 
-		with gr.Row():
-			output_audio = gr.Audio(label=_i18n("output_audio_label"), type="filepath", interactive=False)
+				with gr.Row():
+					output_audio = gr.Audio(label=_i18n("output_audio_label"), type="filepath", interactive=False)
 
-		gr.Examples(
-			examples=EXAMPLE_LIST,
-			inputs=[prompt_audio, target_audio],
-			label=_i18n("examples_label"),
-		)
+				gr.Examples(
+					examples=EXAMPLE_LIST,
+					inputs=[prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, auto_shift, auto_mix_acc, pitch_shift, n_step, cfg, seed_input],
+					label=_i18n("examples_label"),
+				)
 
-		tips_md = gr.Markdown(_tips_md())
+				tips_md = gr.Markdown(_tips_md())
 
-		run_btn.click(
-			fn=_start_svc,
-			inputs=[
-				prompt_audio,
-				target_audio,
-				prompt_vocal_sep,
-				target_vocal_sep,
-				auto_shift,
-				auto_mix_acc,
-				pitch_shift,
-				n_step,
-				cfg,
-				seed_input,
-			],
-			outputs=[output_audio],
-		)
+				run_btn.click(
+					fn=_start_svc,
+					**GPU_EVENT,
+					inputs=[
+						prompt_audio,
+						target_audio,
+						prompt_vocal_sep,
+						target_vocal_sep,
+						auto_shift,
+						auto_mix_acc,
+						pitch_shift,
+						n_step,
+						cfg,
+						seed_input,
+					],
+					outputs=[output_audio],
+				)
 
-		def _change_language(lang):
-			global _GLOBAL_LANG
-			_GLOBAL_LANG = ["zh", "en"][lang]
-			return [
-				gr.update(label=_i18n("display_lang_label")),
-				gr.update(value=_i18n("title")),
-				gr.update(value=_usage_md()),
-				gr.update(label=_i18n("prompt_audio_label")),
-				gr.update(label=_i18n("target_audio_label")),
-				gr.update(label=_i18n("prompt_vocal_sep_label")),
-				gr.update(label=_i18n("target_vocal_sep_label")),
-				gr.update(label=_i18n("auto_shift_label")),
-				gr.update(label=_i18n("auto_mix_acc_label")),
-				gr.update(label=_i18n("pitch_shift_label")),
-				gr.update(label=_i18n("n_step_label")),
-				gr.update(label=_i18n("cfg_label")),
-				gr.update(label=_i18n("seed_label")),
-				gr.update(value=_i18n("run_btn")),
-				gr.update(label=_i18n("output_audio_label")),
-				gr.update(value=_tips_md()),
-			]
+				def _change_language(lang):
+					global _GLOBAL_LANG
+					_GLOBAL_LANG = ["zh", "en"][lang]
+					return [
+						gr.update(label=_i18n("display_lang_label")),
+						gr.update(value=_usage_md()),
+						gr.update(label=_i18n("prompt_audio_label")),
+						gr.update(label=_i18n("target_audio_label")),
+						gr.update(label=_i18n("prompt_vocal_sep_label")),
+						gr.update(label=_i18n("target_vocal_sep_label")),
+						gr.update(label=_i18n("auto_shift_label")),
+						gr.update(label=_i18n("auto_mix_acc_label")),
+						gr.update(label=_i18n("pitch_shift_label")),
+						gr.update(label=_i18n("n_step_label")),
+						gr.update(label=_i18n("cfg_label")),
+						gr.update(label=_i18n("seed_label")),
+						gr.update(value=_i18n("run_btn")),
+						gr.update(label=_i18n("output_audio_label")),
+						gr.update(value=_tips_md()),
+					]
 
-		lang_choice.change(
-			fn=_change_language,
-			inputs=[lang_choice],
-			outputs=[
-				lang_choice,
-				usage_md,
-				prompt_audio,
-				target_audio,
-				prompt_vocal_sep,
-				target_vocal_sep,
-				auto_shift,
-				auto_mix_acc,
-				pitch_shift,
-				n_step,
-				cfg,
-				seed_input,
-				run_btn,
-				output_audio,
-				tips_md,
-			],
-		)
+				lang_choice.change(
+					fn=_change_language,
+					inputs=[lang_choice],
+					outputs=[
+						lang_choice,
+						usage_md,
+						prompt_audio,
+						target_audio,
+						prompt_vocal_sep,
+						target_vocal_sep,
+						auto_shift,
+						auto_mix_acc,
+						pitch_shift,
+						n_step,
+						cfg,
+						seed_input,
+						run_btn,
+						output_audio,
+						tips_md,
+					],
+				)
 
+	page.workspace_theme = theme
 	return page
 
 
@@ -530,6 +535,8 @@ if __name__ == "__main__":
 	parser.add_argument("--port", type=int, default=0, help="Gradio server port (0 = auto)")
 	parser.add_argument("--share", action="store_true", help="Create public link")
 	parser.add_argument("--fp16", action="store_true", help="Use FP16 for SVC model and inference")
+	parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: local only)")
+	parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
 	args = parser.parse_args()
 
 	# Auto-find free port if not specified
@@ -539,7 +546,7 @@ if __name__ == "__main__":
 			_s = _socket.socket()
 			_s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
 			try:
-				_s.bind(("127.0.0.1", _port))
+				_s.bind((args.host, _port))
 				_s.close()
 				args.port = _port
 				break
@@ -549,6 +556,7 @@ if __name__ == "__main__":
 			raise RuntimeError("No free port found in range 17860-17959")
 
 	page = render_interface()
-	page.queue()
-	print(f"SoulX-Singer-SVC WebUI: http://127.0.0.1:{args.port}")
-	page.launch(share=args.share, server_name="127.0.0.1", server_port=args.port, inbrowser=True)
+	page.queue(default_concurrency_limit=1)
+	print(f"SoulX-Singer-SVC WebUI: http://{args.host}:{args.port}")
+	page.launch(share=args.share, server_name=args.host, server_port=args.port, inbrowser=not args.no_browser,
+		theme=page.workspace_theme, css=WORKSPACE_CSS)

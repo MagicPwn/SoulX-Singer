@@ -51,6 +51,9 @@ dist/
 /_internal/pip_freeze_backup.txt
 /_data/
 
+# Private input songs / lyrics (outputs are ignored above)
+/project/
+
 # Local credentials
 .env
 .env.*
