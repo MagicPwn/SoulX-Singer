@@ -75,7 +75,7 @@ class InterfaceBuildTests(unittest.TestCase):
         inputs = next(k.value for k in examples.keywords if k.arg == "inputs")
         self.assertEqual(len(inputs.elts), len(svc.EXAMPLE_LIST[0]))
 
-    def test_primary_upload_is_compact_and_optional_reference_collapsed(self):
+    def test_primary_upload_is_compact_and_timbre_replacement_is_visible(self):
         for module in self.modules:
             page = module.render_interface()
             self.addCleanup(page.close)
@@ -85,8 +85,20 @@ class InterfaceBuildTests(unittest.TestCase):
             self.assertIsNotNone(source)
             from longform.ui import WORKSPACE_CSS
             self.assertIn('#long-source .audio-container { min-height: 160px !important; height: 160px !important; }', WORKSPACE_CSS)
-            optional = next(c for c in components if c['props'].get('elem_id') == 'long-reference-options')
-            self.assertFalse(optional['props']['open'])
+            reference = next(c for c in components if c['props'].get('elem_id') == 'long-timbre-reference')
+            self.assertNotEqual(reference['props'].get('visible'), False)
+
+    def test_workspace_has_five_plain_language_pipeline_stages(self):
+        for module in self.modules:
+            page = module.render_interface()
+            self.addCleanup(page.close)
+            markdown = '\n'.join(str(c['props'].get('value', '')) for c in page.config['components']
+                                 if c['type'] == 'markdown')
+            for title in ('01 · 输入素材', '02 · 处理素材', '03 · 检查中间产物',
+                          '04 · 生成最终人声', '05 · 导出最终产物'):
+                self.assertIn(title, markdown)
+            self.assertIn('换歌词', markdown)
+            self.assertIn('换音色', markdown)
 
     def test_default_workbench_preserves_legacy_events_and_serializes_gpu(self):
         for module in self.modules:
@@ -180,18 +192,99 @@ class WorkspaceTests(unittest.TestCase):
     def test_score_table_passes_loaded_revision_and_rejects_wrong_segment(self):
         import numpy as np
         self.manifest['segments'][0].update(revision=3, metadata=dict(
-            text='春 风', duration='10 10', note_pitch='60 62', note_type='2 2'))
+            text='春 春 <SP> 风', duration='5 5 2 8', note_pitch='60 62 0 64', note_type='2 3 1 2'))
         self.persist()
         rows, loaded = self.workspace.score(str(self.path), '0001')
-        self.assertEqual(rows, [['春', 60, 10., 2], ['风', 62, 10., 2]])
+        self.assertEqual(rows, [['春', 60, 5., '唱新字'], ['春', 62, 5., '延长上字'],
+                                ['休止', 0, 2., '休止'], ['风', 64, 8., '唱新字']])
         self.assertEqual(loaded, dict(segment_id='0001', revision=3))
         service = SimpleNamespace(update_segment_score=Mock(return_value=str(self.path)))
         with patch.object(self.workspace, '_service', return_value=service):
-            self.workspace.save_score(str(self.path), '0001', np.array(rows, dtype=object), loaded)
-            service.update_segment_score.assert_called_once_with(str(self.path), '0001', notes=rows, expected_revision=3)
+            friendly = [['春', 'C4', 5, '唱新字'], ['', 'D4', 5, '延长上字'],
+                        ['休止', '', 2, '休止'], ['风', 64, 8, '2']]
+            self.workspace.save_score(str(self.path), '0001', np.array(friendly, dtype=object), loaded)
+            service.update_segment_score.assert_called_once_with(
+                str(self.path), '0001', notes=[['春', 60, 5., 2], ['春', 62, 5., 3],
+                                                ['<SP>', 0, 2., 1], ['风', 64, 8., 2]],
+                expected_revision=3)
             with self.assertRaises(self.ui.gr.Error):
                 self.workspace.save_score(str(self.path), '0002', rows, loaded)
         self.assertEqual(service.update_segment_score.call_count, 1)
+
+    def test_auto_fill_score_maps_new_lyrics_across_notes_and_keeps_rests(self):
+        rows = [['旧', 60, 1., '唱新字'], ['旧', 62, 1., '延长上字'],
+                ['休止', 0, .5, '休止'], ['词', 64, 1.5, '唱新字']]
+
+        result, summary = self.workspace.autofill_score(rows, '春风\n明月')
+
+        sung = [row[0] for row in result if row[3] == '唱新字']
+        self.assertEqual(sung, ['春', '风', '明', '月'])
+        self.assertEqual(sum(float(row[2]) for row in result), 4.)
+        self.assertTrue(any(row[3] == '休止' and row[2] == .5 for row in result))
+        self.assertIn('4', summary)
+        self.assertIn('保存', summary)
+
+    def test_load_exposes_named_intermediate_assets(self):
+        for name in ('vocal.wav', 'accompaniment.wav', 'prompt.wav', 'manual_metadata.json', 'input.mid'):
+            (self.project / name).touch()
+        self.manifest.update(vocal_path='vocal.wav', accompaniment_path='accompaniment.wav',
+                             manual_metadata_path='manual_metadata.json', midi_path='input.mid',
+                             prompt=dict(source_path='prompt.wav'))
+        self.persist()
+
+        result = self.workspace.intermediates(str(self.path))
+
+        self.assertEqual(result[:3], tuple(str(self.project / name)
+                         for name in ('vocal.wav', 'accompaniment.wav', 'prompt.wav')))
+        self.assertEqual(result[3:], tuple(str(self.project / name)
+                         for name in ('manual_metadata.json', 'input.mid')))
+
+    def test_score_file_inspection_summarizes_metadata_without_models(self):
+        score = self.root / 'score.json'
+        score.write_text(json.dumps([dict(time=[0, 2000], text='春 春 <SP> 风',
+            duration='0.5 0.5 0.25 0.75', note_pitch='60 62 0 64', note_type='2 3 1 2')]),
+            encoding='utf-8')
+
+        tracks, summary = self.ui.inspect_score_upload(str(score))
+
+        self.assertEqual(tracks['value'], 'auto')
+        self.assertIn('1 个片段', summary)
+        self.assertIn('4 行音符/休止', summary)
+        self.assertIn('2 个歌词起音', summary)
+
+    def test_score_file_inspection_accepts_service_metadata_wrapper(self):
+        score = self.root / 'wrapped.json'
+        score.write_text(json.dumps({'segments': [dict(time=[0, 1000], text='春',
+            duration='1', note_pitch='60', note_type='2')]}, ensure_ascii=False), encoding='utf-8')
+
+        _, summary = self.ui.inspect_score_upload(str(score))
+
+        self.assertIn('1 个片段', summary)
+        self.assertIn('1 行音符/休止', summary)
+
+    def test_score_file_inspection_rejects_invalid_metadata_and_empty_midi(self):
+        invalid = self.root / 'invalid.json'
+        invalid.write_text(json.dumps([dict(time=[0, 1000], text='春', duration='1',
+            note_pitch='0', note_type='2')]), encoding='utf-8')
+        with self.assertRaises(self.ui.gr.Error):
+            self.ui.inspect_score_upload(str(invalid))
+
+        import mido
+        empty = self.root / 'empty.mid'
+        mido.MidiFile().save(empty)
+        with self.assertRaises(self.ui.gr.Error):
+            self.ui.inspect_score_upload(str(empty))
+
+    def test_score_table_rejects_zero_pitch_for_sung_rows(self):
+        with self.assertRaises(self.ui.gr.Error):
+            self.workspace.check_score([['春', 0, 1., '唱新字']])
+
+    def test_autofill_allows_note_boundaries_inside_a_lyric_without_false_short_fragment_error(self):
+        rows = [['旧', 60, .49, '唱新字'], ['旧', 62, .51, '延长上字']]
+
+        result, _ = self.workspace.autofill_score(rows, '春')
+
+        self.assertEqual(result, [['春', 60, .49, '唱新字'], ['春', 62, .51, '延长上字']])
 
     def test_midi_track_choice_reaches_prepare_and_segment_import(self):
         service = SimpleNamespace(prepare_project=Mock(return_value=str(self.path)),

@@ -2,6 +2,8 @@
 from pathlib import Path
 import importlib
 import json
+import math
+import re
 
 import gradio as gr
 
@@ -11,25 +13,183 @@ GPU_QUEUE = "soulx-global-gpu"
 GPU_EVENT = dict(concurrency_id=GPU_QUEUE, concurrency_limit=1, show_progress="full")
 
 WORKSPACE_CSS = """
-.gradio-container { max-width: 1320px !important; margin: auto; }
-.workflow-intro { padding: 6px 16px; border-radius: 16px;
-  background: linear-gradient(115deg, #eef2ff, #faf5ff); border: 1px solid #ddd6fe; }
-.workflow-card { border: 1px solid var(--border-color-primary); border-radius: 16px !important;
-  padding: 12px !important; margin-top: 8px; background: var(--block-background-fill); }
+.gradio-container { max-width: 1440px !important; margin: auto; }
+.workflow-intro { padding: 18px 22px; border-radius: 20px;
+  background: var(--block-background-fill); color: var(--body-text-color);
+  border: 1px solid var(--border-color-primary); box-shadow: rgba(0,0,0,.05) 0 8px 24px; }
+.workflow-intro h2 { margin: 0 0 6px !important; font-weight: 500 !important; letter-spacing: -.02em; }
+.workflow-intro p { color: var(--body-text-color) !important; }
+.workflow-stage { border: 1px solid rgba(78,50,23,.12); border-radius: 20px !important;
+  padding: 16px !important; margin-top: 12px; background: var(--block-background-fill);
+  box-shadow: rgba(0,0,0,.035) 0 2px 8px; }
+.workflow-stage h3 { margin: 0 0 4px !important; font-weight: 600 !important; letter-spacing: -.01em; }
+.workflow-stage h4 { margin: 10px 0 3px !important; }
+.stage-guide { color: var(--body-text-color-subdued); margin-bottom: 8px !important; }
+.stage-rail { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 14px; }
+.stage-rail span { padding: 8px 10px; border-radius: 999px; text-align: center; font-size: 12px;
+  font-weight: 600; color: var(--body-text-color); background: var(--background-fill-secondary);
+  border: 1px solid var(--border-color-primary); }
+.purpose-note { padding: 10px 12px; border-radius: 12px; background: rgba(120,113,108,.07); }
 .brand-header { padding: .35rem 0 !important; }
 .brand-header > div:nth-child(3) { margin: .3rem auto !important; height: 1px !important; }
 #long-source .audio-container { min-height: 160px !important; height: 160px !important; }
-.workflow-card h3 { margin-top: 0 !important; }
+#long-timbre-reference .audio-container { min-height: 160px !important; height: 160px !important; }
 #workflow-tabs > .tab-nav { gap: 8px; padding: 8px 0; }
-#workflow-tabs > .tab-nav button { border-radius: 12px; font-weight: 650; padding: 12px 20px; }
+#workflow-tabs > .tab-nav button { border-radius: 999px; font-weight: 650; padding: 12px 20px; }
 #long-manifest textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
-#long-status textarea { line-height: 1.65; }
-@media (max-width: 700px) {
+#long-status textarea, #score-inspection textarea { line-height: 1.65; }
+@media (max-width: 760px) {
  .gradio-container { padding: 10px !important; }
- .workflow-card { padding: 12px !important; }
+ .workflow-stage { padding: 12px !important; }
+ .stage-rail { grid-template-columns: 1fr; }
  #workflow-tabs > .tab-nav button { padding: 10px 12px; }
 }
 """
+
+
+_ACTION_LABELS = {1: "休止", 2: "唱新字", 3: "延长上字"}
+_ACTION_VALUES = {
+    "1": 1, "1.0": 1, "休止": 1, "静音": 1, "rest": 1, "silence": 1, "<sp>": 1,
+    "2": 2, "2.0": 2, "唱新字": 2, "新字": 2, "起音": 2, "onset": 2, "new": 2,
+    "3": 3, "3.0": 3, "延长上字": 3, "延音": 3, "连音": 3, "continue": 3, "tie": 3,
+}
+_NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def _score_action(value):
+    key = str(value).strip().lower()
+    if key not in _ACTION_VALUES:
+        raise ValueError(f"未知唱法“{value}”；请填 唱新字、延长上字 或 休止")
+    return _ACTION_VALUES[key]
+
+
+def _midi_pitch(value):
+    text = str(value).strip()
+    try:
+        number = float(text)
+        if math.isfinite(number) and number.is_integer() and 0 <= number <= 127:
+            return int(number)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    match = re.fullmatch(r"([A-Ga-g])([#b]?)(-?\d+)", text)
+    if match:
+        letter, accidental, octave = match.groups()
+        number = (int(octave) + 1) * 12 + _NOTE_NAMES[letter.upper()]
+        number += 1 if accidental == "#" else -1 if accidental == "b" else 0
+        if 0 <= number <= 127:
+            return number
+    raise ValueError(f"无效音高“{value}”；可填 MIDI 1–127 或音名（如 C4、F#4）；0 保留给休止")
+
+
+def _canonical_score_rows(rows):
+    if hasattr(rows, "tolist"):
+        rows = rows.tolist()
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError("音符表必须是表格")
+    result = []
+    previous_word = None
+    for index, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) != 4:
+            raise ValueError(f"第 {index + 1} 行需要歌词、音高、时长和唱法")
+        if all(value is None or str(value).strip() == "" for value in row):
+            continue
+        try:
+            kind = _score_action(row[3])
+            seconds = float(row[2])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"第 {index + 1} 行：{error}") from error
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(f"第 {index + 1} 行：时长必须大于 0 秒")
+        if kind == 1:
+            word, pitch, previous_word = "<SP>", 0, None
+        else:
+            word = str(row[0]).strip()
+            if kind == 3 and not word:
+                word = previous_word or ""
+            if not word or len(word.split()) != 1 or word in {"休止", "<SP>", "<AP>", "<SIL>"}:
+                raise ValueError(f"第 {index + 1} 行：唱新字需填写歌词；延音可留空并沿用上一字")
+            if kind == 3 and (previous_word is None or word != previous_word):
+                raise ValueError(f"第 {index + 1} 行：延音必须紧跟并沿用上一字")
+            pitch = _midi_pitch(row[1])
+            if pitch == 0:
+                raise ValueError(f"第 {index + 1} 行：演唱音符音高不能为 0，休止请用唱法“休止”")
+            previous_word = word
+        result.append([word, pitch, seconds, kind])
+    if not result:
+        raise ValueError("音符表至少需要一行音符或休止")
+    return result
+
+
+def _friendly_score_rows(metadata):
+    return [["休止" if int(kind) == 1 else word, int(pitch), float(duration), _ACTION_LABELS[int(kind)]]
+            for word, pitch, duration, kind in zip(metadata["text"].split(), metadata["note_pitch"].split(),
+                                                    metadata["duration"].split(), metadata["note_type"].split())]
+
+
+def _allocate_tokens(durations, count):
+    if count < len(durations):
+        raise ValueError(f"歌词只有 {count} 个字/词，但有 {len(durations)} 段被休止分开的演唱；请补足歌词")
+    total = sum(durations)
+    ideals = [count * duration / total for duration in durations]
+    allocated = [1] * len(durations)
+    for _ in range(count - len(durations)):
+        index = max(range(len(durations)), key=lambda i: ideals[i] - allocated[i])
+        allocated[index] += 1
+    return allocated
+
+
+def _fill_sung_run(rows, tokens):
+    total = sum(row[2] for row in rows)
+    cuts = [total * index / len(tokens) for index in range(len(tokens) + 1)]
+    output, cursor, token_index, previous_token = [], 0.0, 0, None
+    token_totals = [0.0] * len(tokens)
+    for _, pitch, seconds, _ in rows:
+        right = cursor + seconds
+        while cursor < right - 1e-9:
+            while token_index + 1 < len(tokens) and cuts[token_index + 1] <= cursor + 1e-9:
+                token_index += 1
+            end = min(right, cuts[token_index + 1])
+            duration = end - cursor
+            action = "唱新字" if token_index != previous_token else "延长上字"
+            output.append([tokens[token_index], pitch, round(duration, 8), action])
+            token_totals[token_index] += duration
+            previous_token = token_index
+            cursor = end
+    if any(span < .03 - 1e-9 for span in token_totals):
+        raise ValueError("自动铺词会产生短于 0.03 秒的字；请减少歌词或在 MIDI 编辑器中精修")
+    return output
+
+
+def _autofill_score_rows(rows, lyrics_text):
+    from longform.lyrics import lyric_tokens
+    tokens = [token for line in lyric_tokens(lyrics_text or "") for token in line]
+    canonical = _canonical_score_rows(rows)
+    runs, current = [], []
+    for row in canonical:
+        if row[3] == 1:
+            if current:
+                runs.append(current)
+                current = []
+            runs.append(row)
+        else:
+            current.append(row)
+    if current:
+        runs.append(current)
+    sung = [run for run in runs if isinstance(run[0], list)]
+    if not sung:
+        raise ValueError("当前片段没有可铺词的音符")
+    counts = _allocate_tokens([sum(row[2] for row in run) for run in sung], len(tokens))
+    output, offset, sung_index = [], 0, 0
+    for run in runs:
+        if not isinstance(run[0], list):
+            output.append(["休止", 0, run[2], "休止"])
+            continue
+        count = counts[sung_index]
+        output.extend(_fill_sung_run(run, tokens[offset:offset + count]))
+        offset += count
+        sung_index += 1
+    return output, (f"已按原音高和总时长铺入 {len(tokens)} 个歌词字/词；休止保持不变。"
+                    "请逐行检查唱法与时长，再点击“保存音符对齐”。")
 
 
 class Workspace:
@@ -180,6 +340,14 @@ class Workspace:
     def select(self, manifest_path, segment_id):
         path, data = self._read(manifest_path)
         return self._preview(path, self._segment(data, segment_id))
+
+    def intermediates(self, manifest_path):
+        """Expose named project artifacts without loading any audio models."""
+        path, data = self._read(manifest_path)
+        prompt = data.get("prompt") if isinstance(data.get("prompt"), dict) else {}
+        return tuple(self._audio(value, path) for value in (
+            data.get("vocal_path"), data.get("accompaniment_path"), prompt.get("source_path"),
+            data.get("manual_metadata_path"), data.get("midi_path")))
 
     @staticmethod
     def _review(segment):
@@ -403,17 +571,26 @@ class Workspace:
         segment = self._segment(data, segment_id)
         meta = segment.get('metadata') or dict(text='<SP>', note_pitch='0', note_type='1',
                                                duration=str(segment['end'] - segment['start']))
-        rows = [[word, int(pitch), float(duration), int(kind)] for word, pitch, duration, kind in
-                zip(meta['text'].split(), meta['note_pitch'].split(),
-                    meta['duration'].split(), meta['note_type'].split())]
-        return rows, dict(segment_id=str(segment_id), revision=segment.get('revision', 0))
+        return _friendly_score_rows(meta), dict(segment_id=str(segment_id), revision=segment.get('revision', 0))
+
+    def autofill_score(self, rows, lyrics_text):
+        """Preview new lyrics on the current note timeline without saving."""
+        return self._invoke(_autofill_score_rows, rows, lyrics_text)
+
+    def check_score(self, rows):
+        normalized = self._invoke(_canonical_score_rows, rows)
+        seconds = sum(row[2] for row in normalized)
+        onsets = sum(row[3] == 2 for row in normalized)
+        ties = sum(row[3] == 3 for row in normalized)
+        rests = sum(row[3] == 1 for row in normalized)
+        return (f"检查通过：{len(normalized)} 行，共 {seconds:.3f} 秒；"
+                f"{onsets} 个歌词起音、{ties} 个延音、{rests} 个休止。尚未保存。")
 
     def save_score(self, manifest_path, segment_id, rows, loaded):
         if not loaded or loaded.get('segment_id') != str(segment_id):
             raise gr.Error('请先刷新当前片段的乐谱 / Reload this segment score before saving.')
         path, _ = self._read(manifest_path)
-        if hasattr(rows, 'tolist'):
-            rows = rows.tolist()
+        rows = self._invoke(_canonical_score_rows, rows)
         result = self._invoke(self._service().update_segment_score, str(path), str(segment_id),
                               notes=rows, expected_revision=loaded['revision'])
         return self.load(result, segment_id)
@@ -502,176 +679,296 @@ def read_lyrics_upload(path):
     return Workspace._invoke(read_lyrics, path)
 
 
-def read_midi_tracks(path):
+def inspect_score_upload(path):
+    """Summarize a metadata/MIDI score before a project mutates."""
     choices = [("自动选择唯一音符轨 / Auto", "auto")]
-    if path and Path(path).suffix.lower() in {'.mid', '.midi'}:
-        from preprocess.tools.midi_parser import midi_tracks
-        for track in Workspace._invoke(midi_tracks, path):
-            choices.append((f"{track['index']}: {track['name']} · {track['notes']} notes", str(track['index'])))
-    return gr.update(choices=choices, value="auto")
+    update = gr.update(choices=choices, value="auto")
+    if not path:
+        return update, "尚未导入乐谱文件。自动分析会从原曲识别音符；导入文件可跳过这一步。"
+    score_path = Path(path)
+    suffix = score_path.suffix.lower()
+    try:
+        if suffix in {'.mid', '.midi'}:
+            from preprocess.tools.midi_parser import midi_tracks
+            tracks = Workspace._invoke(midi_tracks, str(score_path))
+            total = sum(int(track['notes']) for track in tracks)
+            if not tracks or total <= 0:
+                raise ValueError("MIDI 没有可用的演唱音符轨；请提供包含歌词/音符的 MIDI")
+            choices.extend((f"轨道 {track['index']} · {track['name']} · {track['notes']} 个音符", str(track['index']))
+                           for track in tracks)
+            note = "检测到多个音符轨，请明确选择主唱轨。" if len(tracks) > 1 else "已找到唯一音符轨，可保持自动选择。"
+            return gr.update(choices=choices, value="auto"), (
+                f"MIDI 检查通过：{len(tracks)} 个音符轨，共 {total} 个音符。{note} "
+                "MIDI 提供音高和时值；若没有歌词事件，创建项目时必须填写替换歌词并人工复核。")
+        if suffix != '.json':
+            raise ValueError("仅支持 metadata JSON、.mid 或 .midi")
+        with score_path.open(encoding='utf-8') as stream:
+            payload = json.load(stream)
+        if isinstance(payload, dict):
+            payload = payload.get('segments', payload.get('metadata', payload))
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("metadata JSON 顶层必须是片段数组，或包含 segments/metadata 字段")
+        from longform.service import _validate_manual_metadata
+        entries = Workspace._invoke(_validate_manual_metadata, payload)
+        rows = sum(len(entry['words']) for entry in entries)
+        onsets = sum(kind == 2 for entry in entries for kind in entry['types'])
+        rests = sum(kind == 1 for entry in entries for kind in entry['types'])
+        start = end = None
+        for entry in entries:
+            if entry['start'] is not None and entry['end'] is not None:
+                start = entry['start'] if start is None else min(start, entry['start'])
+                end = entry['end'] if end is None else max(end, entry['end'])
+        span = f"，覆盖 {end - start:.2f} 秒" if start is not None and end is not None else ""
+        return update, (f"metadata JSON 检查通过：{len(entries)} 个片段，{rows} 行音符/休止，"
+                        f"{onsets} 个歌词起音，{rests} 个休止{span}。它会直接提供逐字时长并跳过目标音符识别。")
+    except gr.Error:
+        raise
+    except Exception as error:
+        raise gr.Error(f"乐谱文件无法使用：{error}") from error
+
+
+def inspect_metadata_upload(path):
+    return inspect_score_upload(path)[1]
+
+
+def read_midi_tracks(path):
+    return inspect_score_upload(path)[0]
+
+
+def generation_preset(value):
+    return {"试听": (16, 2.0), "推荐": (32, 3.0), "精修": (48, 3.0)}.get(value, (32, 3.0))
 
 
 def render_workspace(root, mode="svs"):
     workspace = Workspace(root, mode)
     gr.Markdown(
-        "### 从一首歌，到完整作品 · Full-song workspace\n"
-        "**01 上传整曲 → 02 检查分段 → 03 逐段试听 / 改词 → 04 合并下载**\n\n"
-        "完整目标不会截短；仅点击「创建项目」后才开始分离 / 分段。进度保存在本机，可随时载入继续。\n"
-        "The full target is preserved. Uploading does not run models. Create a project explicitly, then resume from its manifest.",
+        "## 整曲制作台 · Full-song production\n"
+        "先说明想做什么，再按素材流向向下完成。完整歌曲不会被静默截短，所有中间产物和进度都保存在本机。\n\n"
+        "<div class='stage-rail'><span>01 输入素材</span><span>02 处理素材</span>"
+        "<span>03 检查中间产物</span><span>04 生成人声</span><span>05 导出作品</span></div>",
         elem_classes="workflow-intro")
-    with gr.Column(elem_classes="workflow-card"):
-        gr.Markdown("### 01 · 素材与歌词 / Source & lyrics")
+
+    with gr.Column(elem_classes="workflow-stage"):
+        gr.Markdown("### 01 · 输入素材 / Input assets")
+        gr.Markdown("每份素材只承担一种职责：原曲提供旋律与时间轴，新歌词替换演唱内容，目标音色样本决定谁来唱。",
+                    elem_classes="stage-guide")
         with gr.Row():
-            with gr.Column(scale=1, min_width=230):
-                source = gr.Audio(label="完整目标歌曲 / Full target song · 不截短", type="filepath",
+            with gr.Column(scale=1, min_width=280):
+                gr.Markdown("#### A · 原曲（必填）")
+                source = gr.Audio(label="原曲：提供旋律、节奏与伴奏 · 完整保留", type="filepath",
                                   sources=["upload"], editable=False, elem_id="long-source")
+                gr.Markdown("用途：从这里提取人声、伴奏、音高和换气位置。它不是音色参考。",
+                            elem_classes="purpose-note")
                 language = gr.Dropdown(choices=[("普通话 / Mandarin", "Mandarin"),
                     ("粤语 / Cantonese", "Cantonese"), ("英语 / English", "English")],
-                    value="Mandarin", label="歌词语种 / Lyric language")
-            with gr.Column(scale=2, min_width=280):
-                lyric_file = gr.File(label="歌词文档 / Lyrics document", type="filepath",
-                                     file_types=[".txt", ".doc", ".docx"], height=100, visible=mode == "svs")
-                lyrics = gr.Textbox(label="整曲歌词 / Full lyrics · 导入后可编辑", lines=4, visible=mode == "svs",
-                    placeholder="粘贴歌词或上传 DOC / DOCX / TXT；分段后仍可逐段修改。 / Paste lyrics or import a document.")
+                    value="Mandarin", label="演唱语言：用于把歌词转为发音")
+            with gr.Column(scale=1, min_width=280):
+                gr.Markdown("#### B · 换歌词" if mode == "svs" else "#### B · 演唱内容")
+                lyric_file = gr.File(label="导入新歌词文档（TXT / DOC / DOCX）", type="filepath",
+                                     file_types=[".txt", ".doc", ".docx"], height=120, visible=mode == "svs")
+                lyrics = gr.Textbox(label="要唱的新歌词 · 会替换原歌词", lines=7, visible=mode == "svs",
+                    placeholder="直接粘贴新歌词；一行通常对应一个乐句。创建项目后还能逐段修正。")
                 if mode == "svc":
-                    gr.Markdown("SVC 保留原演唱内容；改词请打开 SVS 整曲工作台。 / "
-                                "SVC preserves the original words. Use the SVS workspace for lyric replacement.")
-        with gr.Accordion("可选参考音色 / Optional voice reference", open=False, elem_id="long-reference-options"):
-            reference = gr.Audio(label="参考音色 / Reference voice · 短采样，不是目标整曲", type="filepath",
-                                 sources=["upload"], editable=False)
-            gr.Markdown("留空从原曲选择；换音色时请上传目标歌手的干净人声，推荐 8–15 秒。 / Leave empty to select from the song; supply 8–15s of clean target-singer vocals to change timbre.")
-            reference_is_vocal = gr.Checkbox(value=False, label="参考已是纯人声 / Reference is already isolated vocal")
+                    gr.Markdown("SVC 只换音色并保留原词。需要换歌词时请使用 SVS 页面。",
+                                elem_classes="purpose-note")
+            with gr.Column(scale=1, min_width=280):
+                gr.Markdown("#### C · 换音色")
+                reference = gr.Audio(label="目标音色样本：决定最终歌手的声音", type="filepath",
+                                     sources=["upload"], editable=False, elem_id="long-timbre-reference")
+                gr.Markdown("上传目标歌手 8–15 秒干净、连续的独唱。留空则沿用原曲中自动选出的音色。",
+                            elem_classes="purpose-note")
+        with gr.Accordion("目标音色样本的高级处理", open=False, elem_id="long-reference-options"):
             with gr.Row():
-                reference_dereverb = gr.Checkbox(value=False, label="参考去混响 / Dereverb reference")
+                reference_is_vocal = gr.Checkbox(value=False, label="样本已是纯人声：不要再次分离")
+                reference_dereverb = gr.Checkbox(value=False, label="减弱样本混响：可能同时损伤气声和辅音")
             with gr.Row():
-                reference_start = gr.Number(value=None, label="参考起点（秒） / Reference start", minimum=0)
-                reference_end = gr.Number(value=None, label="参考终点（秒） / Reference end", minimum=0)
-            gr.Markdown("可选：指定参考人声区间。必须同时填写，区间最长 28 秒且至少含有声片段；留空则自动选择。 / Optional manual interval; fill both fields, max 28s and must contain voiced frames.")
-        manual_metadata = gr.File(label="Corrected metadata JSON (optional)", type="filepath", file_types=[".json"], visible=mode == "svs")
-        midi_input = gr.File(label="MIDI notes/lyrics (optional)", type="filepath", file_types=[".mid", ".midi"], visible=mode == "svs")
-        midi_track = gr.Dropdown(choices=[("自动选择唯一音符轨 / Auto", "auto")], value="auto",
-                                label="MIDI 主唱轨 / Vocal track", visible=mode == "svs")
-        with gr.Accordion("分段选项 / Segmentation options", open=False):
+                reference_start = gr.Number(value=None, label="只用样本中的起点（秒）", minimum=0)
+                reference_end = gr.Number(value=None, label="只用样本中的终点（秒）", minimum=0)
+            gr.Markdown("起点和终点必须同时填写，最长 28 秒；留空会自动寻找 8–15 秒的连续人声。")
+        with gr.Accordion("已有逐字乐谱（可选）· metadata JSON / MIDI", open=False, visible=mode == "svs"):
+            gr.Markdown("没有文件：自动从原曲识别音符和原词，再把新歌词铺进去。\n\n"
+                        "有文件：直接使用其中的逐字音高和时长，跳过目标音符识别；metadata JSON 信息最完整，MIDI 最方便在 DAW 中修改。")
             with gr.Row():
-                max_seconds = gr.Slider(1, 60, value=28, step=1, label="每段上限（秒） / Segment maximum (s)", elem_id="long-max-seconds")
-                min_gap = gr.Slider(.05, 2, value=.3, step=.05, label="换气间隔（秒） / Minimum breath gap (s)")
-                separate = gr.Checkbox(value=True, label="分离人声与伴奏 / Separate vocals & accompaniment")
-                dereverb = gr.Checkbox(value=False, label="目标去混响 / Dereverb target (may remove breathiness)")
-            gr.Markdown("默认 28 秒；密集长句可尝试 **40 秒**，最高 60 秒。无安全切点时会提示调整，不会强行切断持续演唱。 / "
-                        "Default 28s; try **40s** for dense phrases, up to 60s. No forced cuts through continuous singing.")
+                manual_metadata = gr.File(label="导入 metadata JSON：逐字歌词 + 音高 + 时长", type="filepath",
+                                          file_types=[".json"], visible=mode == "svs")
+                midi_input = gr.File(label="导入 MIDI：音符与歌词事件", type="filepath",
+                                     file_types=[".mid", ".midi"], visible=mode == "svs")
+            midi_track = gr.Dropdown(choices=[("自动选择唯一音符轨 / Auto", "auto")], value="auto",
+                                     label="主唱 MIDI 轨：多轨文件必须选择", visible=mode == "svs")
+            score_source_summary = gr.Textbox(label="导入检查结果", value="尚未导入；将自动分析原曲。",
+                                              interactive=False, lines=3, elem_id="score-inspection")
+
+    with gr.Column(elem_classes="workflow-stage"):
+        gr.Markdown("### 02 · 处理素材 / Process assets")
+        gr.Markdown("这一步只制作可恢复的工程和中间产物，不生成最终歌声。处理顺序：复制原曲 → 拆分人声/伴奏 → 提取音高 → 按换气分段 → 识别音符 → 对齐新歌词。",
+                    elem_classes="stage-guide")
+        with gr.Row():
+            separate = gr.Checkbox(value=True, label="保留伴奏：先拆分人声与伴奏")
+            dereverb = gr.Checkbox(value=False, label="减弱原曲人声混响：可能损伤气声")
+        with gr.Accordion("分段参数 · 默认值通常无需修改", open=False):
+            with gr.Row():
+                max_seconds = gr.Slider(1, 60, value=28, step=1,
+                    label="最长连续处理片段（秒）· 防止模型截断", elem_id="long-max-seconds")
+                min_gap = gr.Slider(.05, 2, value=.3, step=.05,
+                    label="可切分的最短换气空隙（秒）· 越大切点越少")
+            gr.Markdown("**最长片段**只限制单次模型输入，不会裁掉整曲。SVS 密集长句可试 40 秒；没有安全气口时会报错，不会硬切持续演唱。")
             if mode == "svc":
-                gr.Markdown("**SVC 例外：安全分段须小于 30 秒**，上面的 40–60 秒仅适用 SVS；原生 SVC 高级模式仍保留。 / "
-                            "**SVC requires segments below 30s**; 40–60s applies to SVS only. Native SVC remains available.")
-        prepare = gr.Button("创建项目并分析分段 / Prepare project", variant="primary", size="lg")
-    with gr.Column(elem_classes="workflow-card"):
-        gr.Markdown("### 02 · 项目与任务 / Project & tasks")
+                gr.Markdown("**SVC 每段必须小于 30 秒**；40–60 秒仅适用于 SVS。")
+        prepare = gr.Button("开始处理素材并创建工程 / Prepare intermediates", variant="primary", size="lg")
         with gr.Row():
-            manifest = gr.Textbox(label="项目清单路径 / Manifest path · 复制此路径可恢复进度", placeholder="outputs/longform/…/manifest.json",
+            manifest = gr.Textbox(label="工程清单路径 · 保存所有素材关系与进度（manifest.json）",
+                                 placeholder="outputs/longform/…/manifest.json",
                                  scale=4, elem_id="long-manifest")
-            load = gr.Button("载入 / 刷新 / Resume", scale=1)
-        status = gr.Textbox(label="任务状态 / Task status", lines=3, interactive=False, elem_id="long-status")
+            load = gr.Button("载入 / 刷新工程", scale=1)
+        status = gr.Textbox(label="当前处理状态与下一步", lines=5, interactive=False, elem_id="long-status")
+        gr.Markdown("载入/刷新只读取磁盘状态，不启动模型；处理失败后可用同一路径继续。")
+        with gr.Accordion("查看素材处理产生的文件", open=False):
+            gr.Markdown("纯人声用于分段和提取音高，伴奏留待最终混音，目标音色片段决定歌手声音；"
+                        "metadata JSON / MIDI 提供逐字音高和时长。")
+            with gr.Row():
+                processed_vocal = gr.File(label="分离后纯人声", interactive=False)
+                processed_accompaniment = gr.File(label="分离后伴奏", interactive=False)
+                processed_prompt = gr.File(label="实际使用的目标音色片段", interactive=False)
+            with gr.Row():
+                processed_metadata = gr.File(label="导入/转换后的 metadata JSON", interactive=False)
+                processed_midi = gr.File(label="工程采用的 MIDI", interactive=False)
+
+    with gr.Column(elem_classes="workflow-stage"):
+        gr.Markdown("### 03 · 检查中间产物 / Review intermediates")
+        gr.Markdown("先确认分段、替换歌词和逐字音符，再生成。这里的修改只让当前片段失效，不会重跑整首歌。",
+                    elem_classes="stage-guide")
         table = gr.Dataframe(headers=["片段 / ID", "开始 / Start", "结束 / End", "切点 / Boundary", "人声 / Voiced",
-                                     "渲染 / Render", "尝试 / Attempts", "歌词 / Lyrics", "错误 / Error", "诊断 / Findings", "人工验收 / Review"],
+                                     "生成状态", "尝试次数", "替换后歌词", "错误", "待检查项", "验收状态"],
                              datatype=["str", "number", "number", "str", "bool", "str", "number", "str", "str", "str", "str"],
-                             value=[], interactive=False, wrap=True, max_height=280)
-        gr.Markdown("刷新只读取已保存的状态，不会启动模型。 / Resume/refresh only reads the saved project.")
-    with gr.Column(elem_classes="workflow-card"):
-        gr.Markdown("### 03 · 片段审听与修改 / Preview & edit")
-        segment = gr.Dropdown(choices=[], label="选择片段 / Select segment", interactive=True)
+                             value=[], interactive=False, wrap=True, max_height=300)
+        segment = gr.Dropdown(choices=[], label="当前检查片段", interactive=True)
         with gr.Row():
-            source_preview = gr.Audio(label="原始片段 / Source segment", type="filepath", interactive=False)
-            generated_preview = gr.Audio(label="生成片段 / Generated segment", type="filepath", interactive=False)
-        segment_lyrics = gr.Textbox(label="当前片段歌词 / Segment lyrics", lines=4, interactive=mode == "svs")
-        with gr.Accordion("音符与歌词对齐 / Edit score alignment", open=False, visible=mode == "svs"):
-            gr.Markdown("按顺序编辑每个音节的音高和时长。休止写 `<SP>`、音高 0、类型 1；"
-                        "新字用类型 2，一字多音的后续音符用类型 3 并重复该字。时长总和不能超过当前片段。\n\n"
-                        "导入文件从当前片段的 **0 秒**开始计时；保存乐谱后重新生成此段。")
-            note_table = gr.Dataframe(headers=["音节 / Syllable", "MIDI 音高", "时长 / Seconds", "note_type"],
-                                      datatype=['str', 'number', 'number', 'number'], type='array',
-                                      col_count=(4, 'fixed'), value=[], interactive=True, max_height=350)
+            source_preview = gr.Audio(label="分离后的人声片段 · 用来核对原旋律/时机", type="filepath", interactive=False)
+            segment_lyrics = gr.Textbox(label="这段要唱的歌词 · 修改后先保存", lines=6,
+                                        interactive=mode == "svs")
+        with gr.Row():
+            save = gr.Button("只保存这段歌词", visible=mode == "svs")
+        with gr.Accordion("逐字音符对齐 · 简易编辑器", open=True, visible=mode == "svs"):
+            gr.Markdown("**唱法不用再记数字：** `唱新字` = 这个音符发出一个新字；`延长上字` = 一字多音；`休止` = 不唱。\n\n"
+                        "音高可填 MIDI 数字或 `C4` / `F#4`。想快速换词：修改上方歌词 → 点“自动铺到音符” → 检查 → 保存。")
+            note_table = gr.Dataframe(headers=["歌词字 / 词", "音高（60 或 C4）", "时长（秒）",
+                                                   "唱法：唱新字 / 延长上字 / 休止"],
+                                      datatype=['str', 'str', 'number', 'str'], type='array',
+                                      column_count=4, value=[], interactive=True, max_height=400)
             score_revision = gr.State({})
-            save_score = gr.Button("保存音符对齐 / Save score", variant='primary')
-            export_score = gr.Button("导出当前片段乐谱 / Export score")
             with gr.Row():
-                score_json = gr.File(label="当前片段 JSON", interactive=False)
-                score_midi = gr.File(label="当前片段 MIDI", interactive=False)
-            score_upload = gr.File(label="导回已修正的片段乐谱 / Import edited score", type='filepath',
-                                   file_types=['.json', '.mid', '.midi'])
-            score_track = gr.Dropdown(choices=[('自动选择唯一音符轨 / Auto', 'auto')], value='auto',
-                                     label='导入 MIDI 主唱轨 / Vocal track')
-            import_score = gr.Button("应用到当前片段 / Apply imported score")
-        with gr.Accordion("F0 检查与修正 / Inspect & edit F0", open=False):
-            f0_summary = gr.Textbox(label="F0 诊断 / F0 diagnostics", interactive=False, lines=4)
+                autofill_score = gr.Button("把上方歌词自动铺到音符", variant='secondary')
+                check_score = gr.Button("检查表格")
+                save_score = gr.Button("保存音符对齐", variant='primary')
+            score_message = gr.Textbox(label="对齐检查结果", interactive=False, lines=2)
+            with gr.Accordion("用外部 MIDI / JSON 精修当前片段", open=False):
+                gr.Markdown("导出文件以**当前片段起点为 0 秒**。可在 DAW / MIDI 编辑器中调整后导回；不要导入整曲绝对时间文件。")
+                export_score = gr.Button("导出当前片段的 JSON + MIDI")
+                with gr.Row():
+                    score_json = gr.File(label="片段 metadata JSON", interactive=False)
+                    score_midi = gr.File(label="片段 MIDI", interactive=False)
+                score_upload = gr.File(label="导回修正后的片段文件", type='filepath',
+                                       file_types=['.json', '.mid', '.midi'])
+                score_track = gr.Dropdown(choices=[('自动选择唯一音符轨 / Auto', 'auto')], value='auto',
+                                          label='导入文件中的主唱轨')
+                score_file_summary = gr.Textbox(label="导入文件检查", interactive=False, lines=2)
+                import_score = gr.Button("应用文件到当前片段")
+        with gr.Accordion("高级：检查/修正连续音高轨 F0", open=False):
+            f0_summary = gr.Textbox(label="F0 诊断 · 音高跳变与漏检帧", interactive=False, lines=4)
             f0_revision = gr.State({})
-            gr.Markdown("F0 以 50Hz JSON 导出。可在音高编辑器中修改 values 数组，长度必须与当前片段一致，静音帧用 0；导回后本段会失效并需重新生成。")
+            gr.Markdown("F0 是从原唱每秒采样 50 次的连续音高曲线，主要用于 Melody 控制和 SVC。"
+                        "导出 JSON 后可修改 `values`；长度不能改变，静音帧填 0。")
             with gr.Row():
-                export_f0 = gr.Button("导出 F0 JSON / Export F0")
+                export_f0 = gr.Button("导出 F0 JSON")
                 f0_file = gr.File(label="F0 JSON", interactive=False)
-            f0_upload = gr.File(label="导回修正 F0 / Import corrected F0", type='filepath', file_types=['.json'])
-            import_f0 = gr.Button("应用 F0 修正 / Apply F0")
-        with gr.Row():
-            save = gr.Button("保存歌词 / Save lyrics", visible=mode == "svs")
-            regenerate = gr.Button("保存并重新生成此段 / Save & regenerate segment" if mode == "svs" else "重新生成此段 / Regenerate segment", variant="primary")
-        with gr.Accordion("A/B 试听与版本选择 / Compare & select", open=False, visible=mode == "svs"):
-            gr.Markdown("比较使用**已保存**的歌词与乐谱。原词组保留原始对齐，人工改过乐谱时，两组的音符也可能不同。")
-            include_original = gr.Checkbox(value=False, label="同时比较原词 / Include original lyrics (4 renders)")
-            compare = gr.Button("生成独立 A/B 试听 / Generate comparison")
-            with gr.Row():
-                current_melody = gr.Audio(label="当前词 · Melody", interactive=False, type='filepath')
-                current_score = gr.Audio(label="当前词 · Score", interactive=False, type='filepath')
-            with gr.Row():
-                original_melody = gr.Audio(label="原始词/对齐 · Melody", interactive=False, type='filepath')
-                original_score = gr.Audio(label="原始词/对齐 · Score", interactive=False, type='filepath')
-            variant = gr.Dropdown(choices=[], label="可采用的当前词版本 / Available current-lyric versions", interactive=True)
-            variant_audio = gr.Audio(label="所选版本试听 / Selected version", interactive=False, type='filepath')
-            comparison_details = gr.Textbox(label="比较记录 / Comparison record", interactive=False, lines=3)
-            adopt = gr.Button("采用此版本 / Use selected version")
-        with gr.Accordion("人工复核与验收 / Human review", open=True):
-            review_status = gr.Textbox(label="当前片段验收状态 / Segment review", interactive=False, lines=2)
+            f0_upload = gr.File(label="导回修正后的 F0 JSON", type='filepath', file_types=['.json'])
+            import_f0 = gr.Button("应用 F0 修正")
+        with gr.Accordion("输入复核", open=True):
+            review_status = gr.Textbox(label="当前片段复核状态", interactive=False, lines=2)
             review_loaded = gr.State({})
-            gr.Markdown("先核对歌词、音符和 F0 提示，再试听当前生成音频。验收只适用于本次音频及其输入；"
-                        "保存修改或重新生成后需重新试听。原有诊断记录会保留。")
-            with gr.Row():
-                align_review = gr.Button("已核对对齐 / F0 / Inputs reviewed")
-                accept = gr.Button("已试听，验收此段 / Accept listened render", variant='primary')
-                reopen = gr.Button("撤回验收 / Reopen review")
-        with gr.Accordion("生成参数 / Generation settings", open=False):
-            with gr.Row():
-                seed = gr.Number(value=42, precision=0, label="种子 / Seed")
-                n_steps = gr.Slider(1, 200, value=32, step=1, label="采样步数 / Steps")
-                cfg = gr.Slider(0, 10, value=3, step=.1, label="CFG")
-                pitch = gr.Slider(-36, 36, value=0, step=1, label="变调（半音） / Pitch shift")
-            with gr.Row():
-                auto_shift = gr.Checkbox(value=False, label="自动变调 / Auto pitch shift")
-                control = gr.Dropdown(choices=[("旋律 / Melody", "melody"), ("乐谱 / Score", "score")],
-                                      value="score", label="控制类型 / Control", visible=mode == "svs")
-                mix = gr.Checkbox(value=True, label="混入伴奏 / Mix accompaniment")
-        run = gr.Button("生成剩余 / 继续任务 · Run remaining (skip completed)", variant="primary", size="lg")
-        with gr.Accordion("重新生成全部 / Regenerate all", open=False):
-            gr.Markdown("使用各片段**已保存**的歌词。此操作会重新生成已完成片段；普通继续任务不会。 / "
-                        "Uses saved segment lyrics and regenerates completed segments too.")
-            confirm = gr.Checkbox(value=False, label="确认重新生成全部片段 / Confirm regenerate all")
-            regenerate_all = gr.Button("重新生成全部 / Regenerate all", variant="stop")
-    with gr.Column(elem_classes="workflow-card"):
-        gr.Markdown("### 04 · 整曲导出 / Assemble & download")
+            gr.Markdown("听原人声并检查上方歌词/音符/F0。标记完成后仍需在生成阶段试听最终结果。")
+            align_review = gr.Button("歌词、音符与 F0 已核对")
+
+    with gr.Column(elem_classes="workflow-stage"):
+        gr.Markdown("### 04 · 生成最终人声 / Generate final vocals")
+        gr.Markdown("模型使用已保存的逐段歌词/音符和目标音色样本生成新的人声。先生成一段试听，满意后再生成剩余片段。",
+                    elem_classes="stage-guide")
+        generated_preview = gr.Audio(label="当前片段的最新生成人声", type="filepath", interactive=False)
         with gr.Row():
-            merge = gr.Button("合并试听草稿 / Assemble draft")
-            export_accepted = gr.Button("导出已验收整曲 / Export accepted song", variant="primary")
+            regenerate = gr.Button("生成 / 重做当前片段", variant="primary")
+            run = gr.Button("生成所有未完成片段", variant="primary", size="lg")
+        with gr.Accordion("生成参数 · 有听感问题时再调整", open=False):
+            preset = gr.Radio(choices=["试听", "推荐", "精修"], value="推荐",
+                              label="质量预设：试听更快，精修更慢")
+            with gr.Row():
+                seed = gr.Number(value=42, precision=0, label="随机版本号 · 相同输入+相同值可复现")
+                n_steps = gr.Slider(1, 200, value=32, step=1, label="生成精细度 · 越高越慢")
+                cfg = gr.Slider(0, 10, value=3, step=.1,
+                                label="音色/旋律跟随强度 · 过高易失真，建议 1–3")
+                pitch = gr.Slider(-36, 36, value=0, step=1,
+                                  label="人声整体升降调（半音）· 混原伴奏时慎用")
+            with gr.Row():
+                auto_shift = gr.Checkbox(value=False, label="自动把人声音域匹配到目标音色")
+                control = gr.Dropdown(
+                    choices=[("乐谱锁定节奏 · 换歌词推荐", "score"),
+                             ("跟随原唱连续旋律 · 保留原词时更自然", "melody")],
+                    value="score", label="旋律控制方式", visible=mode == "svs")
+        with gr.Accordion("A/B 比较 · 判断换词应使用哪种旋律控制", open=False, visible=mode == "svs"):
+            gr.Markdown("使用**已保存**的歌词和音符，分别生成“乐谱锁节奏”和“跟随原唱旋律”。勾选原词后会额外生成原词基准。")
+            include_original = gr.Checkbox(value=False, label="同时生成原词基准（共 4 个版本）")
+            compare = gr.Button("生成 A/B 试听")
+            with gr.Row():
+                current_melody = gr.Audio(label="新歌词 · 跟随原唱旋律", interactive=False, type='filepath')
+                current_score = gr.Audio(label="新歌词 · 乐谱锁节奏", interactive=False, type='filepath')
+            with gr.Row():
+                original_melody = gr.Audio(label="原歌词 · 跟随原唱旋律", interactive=False, type='filepath')
+                original_score = gr.Audio(label="原歌词 · 乐谱锁节奏", interactive=False, type='filepath')
+            variant = gr.Dropdown(choices=[], label="从历史 A/B 中选择要采用的新歌词版本", interactive=True)
+            variant_audio = gr.Audio(label="所选版本试听", interactive=False, type='filepath')
+            comparison_details = gr.Textbox(label="版本所用参数", interactive=False, lines=3)
+            adopt = gr.Button("采用这个版本作为当前片段")
+        with gr.Accordion("试听验收", open=True):
+            gr.Markdown("验收绑定当前输入和当前音频；改歌词、音符、F0 或重新生成后会自动撤回。")
+            with gr.Row():
+                accept = gr.Button("已试听，验收当前片段", variant='primary')
+                reopen = gr.Button("撤回当前片段验收")
+        with gr.Accordion("危险操作：重做所有片段", open=False):
+            confirm = gr.Checkbox(value=False, label="确认：连已完成片段也全部重做")
+            regenerate_all = gr.Button("重新生成全部片段", variant="stop")
+
+    with gr.Column(elem_classes="workflow-stage"):
+        gr.Markdown("### 05 · 导出最终产物 / Export deliverables")
+        gr.Markdown("先选择是否把新的人声放回原伴奏，再合成试听草稿或只导出全部已验收的正式版本。",
+                    elem_classes="stage-guide")
+        with gr.Row():
+            mix = gr.Checkbox(value=True, label="最终成品混入原伴奏 · 关闭则只导出人声")
             output_sample_rate = gr.Dropdown(
-                choices=[('跟随项目 / Project default', 'auto'), ('24 kHz', '24000'),
+                choices=[('跟随工程默认值', 'auto'), ('24 kHz', '24000'),
                          ('44.1 kHz', '44100'), ('48 kHz', '48000')],
-                value='auto', label='最终采样率 / Final sample rate', scale=1)
-        gr.Markdown("草稿允许存在待复核片段；已验收导出要求全部演唱片段通过当前版本的人工验收。")
+                value='auto', label='导出采样率', scale=1)
         with gr.Row():
-            final = gr.Audio(label="整曲结果 / Full song (mix setting applied)", type="filepath", interactive=False)
-            raw = gr.Audio(label="纯人声 / Raw vocal", type="filepath", interactive=False)
+            merge = gr.Button("合成试听草稿 · 允许未验收片段")
+            export_accepted = gr.Button("导出正式成品 · 要求全部验收", variant="primary")
+        gr.Markdown("非八度升降调的人声不能直接叠加原调伴奏；遇到这种情况请导出纯人声，或用 0 / ±12 半音重新生成。")
         with gr.Row():
-            final_file = gr.File(label="下载整曲 WAV / Download full song", interactive=False)
-            raw_file = gr.File(label="下载纯人声 WAV / Download raw vocal", interactive=False)
+            final = gr.Audio(label="最终整曲 / 混音结果", type="filepath", interactive=False)
+            raw = gr.Audio(label="最终纯人声", type="filepath", interactive=False)
+        with gr.Row():
+            final_file = gr.File(label="下载整曲 WAV", interactive=False)
+            raw_file = gr.File(label="下载纯人声 WAV", interactive=False)
+
     outputs = [manifest, status, table, segment, source_preview, generated_preview, segment_lyrics, final, raw, final_file, raw_file]
     settings = [seed, n_steps, cfg, auto_shift, pitch, control, mix]
     lyric_file.upload(read_lyrics_upload, [lyric_file], [lyrics], queue=False, api_name="long_read_lyrics")
-    midi_input.change(read_midi_tracks, [midi_input], [midi_track], queue=False, api_name="long_midi_tracks")
+    manual_metadata.change(inspect_metadata_upload, [manual_metadata], [score_source_summary],
+                           queue=False, api_name="long_metadata_inspect")
+    midi_input.change(inspect_score_upload, [midi_input], [midi_track, score_source_summary],
+                      queue=False, api_name="long_midi_tracks")
+    preset.change(generation_preset, [preset], [n_steps, cfg], queue=False, api_name="long_generation_preset")
+    autofill_score.click(workspace.autofill_score, [note_table, segment_lyrics], [note_table, score_message],
+                         queue=False, api_name="long_autofill_score")
+    check_score.click(workspace.check_score, [note_table], [score_message],
+                      queue=False, api_name="long_check_score")
     refresh_events = []
     refresh_events.append(prepare.click(workspace.prepare, [source, lyrics, lyric_file, reference, max_seconds, min_gap, language, separate, manual_metadata, reference_is_vocal, midi_input, midi_track, reference_start, reference_end, dereverb, reference_dereverb], outputs,
                   api_name="long_prepare", **GPU_EVENT))
@@ -704,10 +1001,15 @@ def render_workspace(root, mode="svs"):
                                          api_name='long_import_f0', **GPU_EVENT))
     export_score.click(workspace.export_score, [manifest, segment], [score_json, score_midi],
                        api_name='long_export_score', **GPU_EVENT)
-    score_upload.change(read_midi_tracks, [score_upload], [score_track], queue=False, api_name='long_score_tracks')
+    score_upload.change(inspect_score_upload, [score_upload], [score_track, score_file_summary],
+                        queue=False, api_name='long_score_tracks')
     export_f0.click(workspace.export_f0, [manifest, segment], [f0_file],
                     api_name='long_export_f0', **GPU_EVENT)
     for index, event in enumerate(refresh_events):
+        event.then(workspace.intermediates, [manifest],
+                   [processed_vocal, processed_accompaniment, processed_prompt,
+                    processed_metadata, processed_midi],
+                   queue=False, api_name='long_intermediates' if index == 0 else False)
         event.then(workspace.score, [manifest, segment], [note_table, score_revision], queue=False,
                    api_name='long_score' if index == 0 else False)
         event.then(workspace.review, [manifest, segment], [review_status, review_loaded], queue=False,
