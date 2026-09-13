@@ -383,6 +383,15 @@ def _prepare_remaining(manifest, path):
 
 def _prepare_prompt(manifest, path):
     job = Path(path).parent
+    # Tolerate a persisted zero-length (0-0) crop — the empty state of the
+    # optional reference-crop fields — as "no manual crop", so a resumed
+    # manifest does not fail validation on an empty interval.
+    if manifest.get('reference_start') is not None and manifest.get('reference_end') is not None:
+        try:
+            if float(manifest['reference_start']) == 0.0 and float(manifest['reference_end']) == 0.0:
+                manifest['reference_start'] = manifest['reference_end'] = None
+        except (TypeError, ValueError):
+            pass
     if manifest.get('reference'):
         vocal = job / 'reference_vocal.wav'
         if manifest.get('reference_separate', manifest['separate']):
@@ -588,6 +597,12 @@ def prepare_project(source, lyrics_text='', lyric_file=None, reference=None,
     if (reference_start is not None and not isinstance(reference_start, (int, float))) or \
        (reference_end is not None and not isinstance(reference_end, (int, float))):
         raise ValueError('Reference interval must be numeric seconds')
+    # The UI's optional reference-crop fields arrive as 0.0/0.0 when left empty.
+    # A zero-length interval is "no manual crop": normalize it so preparation
+    # auto-detects a prompt window instead of failing on an empty interval.
+    if reference_start is not None and reference_end is not None \
+            and float(reference_start) == 0.0 and float(reference_end) == 0.0:
+        reference_start = reference_end = None
     if not isinstance(dereverb, bool) or (reference_dereverb is not None and not isinstance(reference_dereverb, bool)):
         raise ValueError('dereverb settings must be boolean')
     if reference_dereverb is None:

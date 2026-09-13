@@ -423,9 +423,11 @@ class Workspace:
             lyric_file=None if lyrics_text else lyric_file, reference=reference,
             max_seconds=float(max_seconds), min_gap=float(min_gap), mode=self.mode,
             language=language, separate=bool(separate))
-        if reference_start not in (None, "") or reference_end not in (None, ""):
-            prepare_kwargs["reference_start"] = float(reference_start)
-            prepare_kwargs["reference_end"] = float(reference_end)
+        start_val = None if reference_start in (None, "") else float(reference_start)
+        end_val = None if reference_end in (None, "") else float(reference_end)
+        if start_val is not None and end_val is not None and end_val > start_val:
+            prepare_kwargs["reference_start"] = start_val
+            prepare_kwargs["reference_end"] = end_val
         if dereverb:
             prepare_kwargs["dereverb"] = True
         if reference_dereverb:

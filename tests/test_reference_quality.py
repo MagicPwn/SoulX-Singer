@@ -228,5 +228,44 @@ class ReferenceQualityTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
 
+    def test_zero_length_reference_interval_is_treated_as_auto_detect(self):
+        """A 0-0 crop (the fields left empty) must auto-detect, not fail validation."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / 'reference.wav'
+            sf.write(reference, np.full(12 * 24000, .1), 24000)
+            job = root / ('z' * 32)
+            job.mkdir()
+            manifest_path = job / 'manifest.json'
+            manifest = dict(reference=str(reference), reference_separate=False,
+                            separate=False, duration=12., min_gap=.3, mode='svs',
+                            language='Mandarin', segments=[dict(voiced=True)],
+                            reference_start=0.0, reference_end=0.0)
+            with patch.object(service, '_extract_f0', return_value=np.full(600, 220.)):
+                service._prepare_prompt(manifest, manifest_path)
+            prompt = manifest['prompt']
+            self.assertIsNotNone(prompt)
+            self.assertFalse(prompt['quality']['manual_interval'])
+            self.assertIsNone(manifest['reference_start'])
+            self.assertIsNone(manifest['reference_end'])
+
+    def test_prepare_project_normalizes_zero_length_reference_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.wav'
+            reference = root / 'reference.wav'
+            sf.write(source, np.full(10 * 24000, .1), 24000)
+            sf.write(reference, np.full(10 * 24000, .1), 24000)
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', return_value=np.full(500, 220.)):
+                path = service.prepare_project(source, reference=reference, mode='svc',
+                                               separate=False, reference_start=0.0, reference_end=0.0)
+            saved = json.loads(Path(path).read_text(encoding='utf-8'))
+            self.assertIsNone(saved['reference_start'])
+            self.assertIsNone(saved['reference_end'])
+            self.assertNotEqual(saved.get('status'), 'failed')
+            self.assertIsNotNone(saved.get('prompt'))
+
+
 if __name__ == '__main__':
     unittest.main()
