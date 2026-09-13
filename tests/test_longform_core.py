@@ -74,6 +74,50 @@ class PlannerTests(unittest.TestCase):
         f0[700:710] = 0
         with self.assertRaisesRegex(ValueError, "interval"):
             self.require_core().plan_segments(f0, 32.0)
+
+    def test_short_breath_requires_audio_evidence_and_keeps_hard_cap(self):
+        f0 = np.full(1600, 220.0)
+        f0[700:710] = 0  # 200 ms breath, below the preferred 300 ms
+        rms = np.full(len(f0), 0.1)
+        rms[700:710] = 0.001
+        original = f0.copy()
+        segments = self.require_core().plan_segments(f0, 32.0, frame_rms=rms)
+        self.assert_coverage(segments, 32.0, 28.0)
+        self.assertAlmostEqual(segments[0]['end'], 14.1)
+        self.assertEqual(segments[0]['boundary'], 'short_breath')
+        self.assertEqual(segments[0]['cut_evidence']['kind'], 'unvoiced_low_energy')
+        np.testing.assert_array_equal(f0, original)
+
+    def test_short_breath_rejects_loud_dropouts_voicing_and_tiny_pauses(self):
+        for kind in ('loud_dropout', 'still_voiced', 'tiny_pause', 'scattered_quiet'):
+            f0 = np.full(1600, 220.0)
+            rms = np.full(len(f0), .1)
+            f0[700:710] = 0
+            if kind == 'still_voiced':
+                f0[700:710] = 220
+                rms[700:710] = .001
+            elif kind == 'tiny_pause':
+                f0[704:710] = 220
+                rms[700:704] = .001
+            elif kind == 'scattered_quiet':
+                rms[700:710:2] = .001
+            with self.subTest(kind=kind), self.assertRaises(core.NoSafeCut):
+                core.plan_segments(f0, 32.0, frame_rms=rms)
+
+    def test_normal_breath_plan_is_preferred_over_short_breaths(self):
+        f0 = np.full(1600, 220.0)
+        f0[700:710] = f0[990:1010] = 0
+        rms = np.where(f0 > 0, .1, .001)
+        self.assertEqual(core.plan_segments(f0, 32.0), core.plan_segments(f0, 32.0, frame_rms=rms))
+
+    def test_short_breath_invalid_energy_is_rejected(self):
+        f0 = np.full(1600, 220.0)
+        f0[700:710] = 0
+        for energy in (np.ones(1599), np.ones((1600, 1)), np.full(1600, np.nan),
+                       np.full(1600, -1), np.full(1600, np.inf)):
+            with self.subTest(shape=energy.shape), self.assertRaisesRegex(ValueError, 'frame_rms'):
+                core.plan_segments(f0, 32.0, frame_rms=energy)
+
     def test_invalid_f0_and_timing_are_rejected(self):
         cases = [([np.nan], 0.02, {}), ([-1], 0.02, {}),
                  ([[220]], 0.02, {}), ([], 1.0, {}),

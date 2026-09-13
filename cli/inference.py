@@ -154,9 +154,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--control",
         type=str,
-        default="melody",
+        default="score",
         choices=["melody", "score"],
-        help="Control mode: melody or score only",
+        help="Control mode: score is recommended when lyrics change; use melody to preserve the original expressive F0 contour",
     )
     parser.add_argument(
         "--fp16",

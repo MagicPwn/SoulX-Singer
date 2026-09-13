@@ -6,18 +6,19 @@ note_pitch, note_type per segment) and standard MIDI files. Uses an internal
 Note dataclass (start_s, note_dur, note_text, note_pitch, note_type) as the
 intermediate representation.
 """
+from __future__ import annotations
+
 import os
 import json
 import shutil
+from bisect import bisect_right
 from dataclasses import dataclass
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Tuple, Union, TYPE_CHECKING
 
-import librosa
 import mido
-from soundfile import write
 
-from .f0_extraction import F0Extractor
-from .g2p import g2p_transform
+if TYPE_CHECKING:
+    from .f0_extraction import F0Extractor
 
 
 # Audio, MIDI and segmentation constants
@@ -29,7 +30,6 @@ MIDI_VELOCITY = 64              # Default velocity for note_on events; not criti
 END_EXTENSION_SEC = 0.4         # Extend each segment end by this much silence (sec) to give the model more context
 MAX_GAP_SEC = 2.0               # Gap threshold to split segments in midi2meta (sec)
 MAX_SEGMENT_DUR_SUM_SEC = 60.0  # Max total duration sum of notes in a single metadata segment before splitting into multiple segments (sec)
-SILENCE_THRESHOLD_SEC = 0.2     # Threshold to insert explicit <SP> note for long silences between notes in midi2notes (sec)
 
 
 @dataclass
@@ -40,6 +40,7 @@ class Note:
     note_text: str
     note_pitch: int
     note_type: int
+    lyric_missing: bool = False
 
     @property
     def end_s(self) -> float:
@@ -67,6 +68,7 @@ def _append_segment_to_meta(
     note_dur: List[float],
 ) -> None:
     """Helper function for midi2meta to append the current segment (accumulated in note_*) to meta_data list, with optional wav cut and pitch extraction."""
+    from .g2p import g2p_transform
     if not all((note_start, note_end, note_text, note_pitch, note_type, note_dur)):
         return
 
@@ -74,6 +76,7 @@ def _append_segment_to_meta(
     item_name = f"{base_name}_{len(meta_data)}"
     wav_fn = None
     if cut_wavs_output_dir and vocal_file and audio_data is not None:
+        from soundfile import write
         wav_fn = os.path.join(cut_wavs_output_dir, f"{item_name}.wav")
         end_pad = int(END_EXTENSION_SEC * SAMPLE_RATE)
         start_sample = max(0, int(note_start[0] * SAMPLE_RATE))
@@ -179,6 +182,7 @@ def notes2meta(
     meta_data: List[dict] = []
     audio_data = None
     if vocal_file:
+        import librosa
         audio_data, _ = librosa.load(vocal_file, sr=SAMPLE_RATE, mono=True)
     dur_sum = 0.0
 
@@ -235,7 +239,7 @@ def notes2meta(
         if text == "" or pitch == "" or type_ == "":
             append_note(start, end, "<SP>", 0, 1)
             continue
-        
+
         # cut the segment when ends with a long <SP> note
         if (
             len(note_text) > 0
@@ -304,9 +308,10 @@ def notes2midi(
         if n.note_type == 3:
             lyric = "-"
 
-        events.append(
-            (start_ticks, 1, mido.MetaMessage("lyrics", text=lyric, time=0))
-        )
+        if not n.lyric_missing:
+            events.append(
+                (start_ticks, 1, mido.MetaMessage("lyrics", text=lyric, time=0))
+            )
         events.append(
             (
                 start_ticks,
@@ -353,150 +358,164 @@ def notes2midi(
     mid.save(midi_path)
 
 
-def midi2notes(midi_path: str) -> List[Note]:
-    """Parse MIDI file into a list of Note."""
-    mid = mido.MidiFile(midi_path)
-    ticks_per_beat = mid.ticks_per_beat
-    tempo = 500000
-
-    raw_notes: List[dict] = []
-    lyrics: List[Tuple[int, str]] = []
-
+def _midi_events(mid):
+    if mid.type == 2 or mid.ticks_per_beat <= 0:
+        raise ValueError('Require synchronous MIDI type 0/1 with PPQ timing')
+    tracks = []
     for track in mid.tracks:
-        abs_ticks = 0
-        active = {}
-        for msg in track:
-            abs_ticks += msg.time
-            if msg.type == "set_tempo":
-                tempo = msg.tempo
-            elif msg.type == "lyrics":
-                text = msg.text
-                try:
-                    text = text.encode("latin1").decode("utf-8")
-                except Exception:
-                    pass
-                lyrics.append((abs_ticks, text))
-            elif msg.type == "note_on":
-                key = (msg.channel, msg.note)
-                if msg.velocity > 0:
-                    active[key] = (abs_ticks, msg.velocity)
-                else:
-                    if key in active:
-                        start_ticks, vel = active.pop(key)
-                        raw_notes.append(
-                            {
-                                "midi": msg.note,
-                                "start_ticks": start_ticks,
-                                "duration_ticks": abs_ticks - start_ticks,
-                                "velocity": vel,
-                                "lyric": "",
-                            }
-                        )
-            elif msg.type == "note_off":
-                key = (msg.channel, msg.note)
-                if key in active:
-                    start_ticks, vel = active.pop(key)
-                    raw_notes.append(
-                        {
-                            "midi": msg.note,
-                            "start_ticks": start_ticks,
-                            "duration_ticks": abs_ticks - start_ticks,
-                            "velocity": vel,
-                            "lyric": "",
-                        }
-                    )
+        cursor, events = 0, []
+        for message in track:
+            if message.time < 0:
+                raise ValueError('MIDI event times must be nonnegative')
+            cursor += message.time
+            events.append((cursor, message))
+        tracks.append(events)
+    return tracks
 
-    if not raw_notes:
-        raise ValueError("No notes found in MIDI file")
 
-    for n in raw_notes:
-        n["end_ticks"] = n["start_ticks"] + n["duration_ticks"]
+def midi_tracks(midi_path: str) -> list[dict]:
+    """List note-bearing tracks without loading audio or ML dependencies."""
+    mid = mido.MidiFile(midi_path)
+    tracks = _midi_events(mid)
+    return [dict(index=i, name=mid.tracks[i].name or f'Track {i}',
+                 notes=sum(m.type == 'note_on' and m.velocity > 0 for _, m in events))
+            for i, events in enumerate(tracks)
+            if any(m.type == 'note_on' and m.velocity > 0 for _, m in events)]
 
-    raw_notes.sort(key=lambda n: n["start_ticks"])
-    lyrics.sort(key=lambda x: x[0])
 
-    trimmed = []
-    # Remove/trim overlaps so generated notes are strictly non-overlapping in tick domain.
-    for note in raw_notes:
-        while trimmed:
-            prev = trimmed[-1]
-            if note["start_ticks"] < prev["end_ticks"]:
-                prev["end_ticks"] = note["start_ticks"]
-                prev["duration_ticks"] = prev["end_ticks"] - prev["start_ticks"]
-                if prev["duration_ticks"] <= 0:
-                    trimmed.pop()
-                    continue
-            break
-        trimmed.append(note)
-    raw_notes = trimmed
+def midi2notes(midi_path: str, track_index: int | None = None, *,
+               allow_missing_lyrics: bool = False) -> List[Note]:
+    """Read one monophonic vocal track, preserving tempo changes and every rest.
 
-    tolerance = ticks_per_beat // 100
-    # Attach lyrics near note_on positions with a small tick tolerance.
-    lyric_idx = 0
-    for note in raw_notes:
-        while lyric_idx < len(lyrics) and lyrics[lyric_idx][0] < note["start_ticks"] - tolerance:
-            lyric_idx += 1
-        if lyric_idx < len(lyrics):
-            lyric_ticks, lyric_text = lyrics[lyric_idx]
-            if abs(lyric_ticks - note["start_ticks"]) <= tolerance:
-                note["lyric"] = lyric_text
-                lyric_idx += 1
+    Multiple note tracks require explicit selection. Overlaps, ambiguous lyrics,
+    orphan ties and unfinished notes are errors rather than silent corrections.
+    Missing words are only scaffolded when explicitly requested by a caller that
+    will supply replacement lyrics; that provenance remains on each Note.
+    """
+    mid = mido.MidiFile(midi_path)
+    tracks = _midi_events(mid)
+    choices = [i for i, events in enumerate(tracks)
+               if any(m.type == 'note_on' and m.velocity > 0 for _, m in events)]
+    if not choices:
+        raise ValueError('No notes found in MIDI file')
+    if track_index is None:
+        if len(choices) != 1:
+            labels = ', '.join(f'{i}: {mid.tracks[i].name or "unnamed"}' for i in choices)
+            raise ValueError(f'MIDI has multiple note tracks; select the vocal MIDI track ({labels})')
+        track_index = choices[0]
+    if isinstance(track_index, bool) or not isinstance(track_index, int) or track_index not in choices:
+        raise ValueError('MIDI track index must identify a track containing notes')
 
-    def ticks_to_seconds(ticks: int) -> float:
-        return (ticks / ticks_per_beat) * (tempo / 1_000_000)
+    # Conductor tempo events apply even when a different note track is selected.
+    changes = {}
+    for events in tracks:
+        for tick, msg in events:
+            if msg.type == 'set_tempo':
+                if msg.tempo <= 0:
+                    raise ValueError('MIDI tempo must be positive')
+                if tick in changes and changes[tick] != msg.tempo:
+                    raise ValueError(f'Conflicting MIDI tempos at tick {tick}')
+                changes[tick] = msg.tempo
+    tempo_ticks, tempo_seconds, tempos = [0], [0.0], [changes.pop(0, 500000)]
+    for tick, tempo in sorted(changes.items()):
+        seconds = tempo_seconds[-1] + mido.tick2second(tick - tempo_ticks[-1], mid.ticks_per_beat, tempos[-1])
+        tempo_ticks.append(tick)
+        tempo_seconds.append(seconds)
+        tempos.append(tempo)
 
-    result: List[Note] = []
-    prev_end_s = 0.0
-    for idx, n in enumerate(raw_notes):
-        start_s = ticks_to_seconds(n["start_ticks"])
-        end_s = ticks_to_seconds(n["end_ticks"])
-        if prev_end_s > start_s:
-            start_s = prev_end_s
-        dur_s = end_s - start_s
-        if dur_s <= 0:
+    def seconds(tick):
+        index = bisect_right(tempo_ticks, tick) - 1
+        return tempo_seconds[index] + mido.tick2second(tick - tempo_ticks[index], mid.ticks_per_beat, tempos[index])
+
+    active, raw_notes = {}, []
+    # At a common tick a note-off precedes the next onset of the same pitch.
+    def priority(event):
+        tick, msg = event
+        is_off = msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0)
+        return tick, 0 if is_off else 1
+
+    for tick, msg in sorted(tracks[track_index], key=priority):
+        if msg.type not in {'note_on', 'note_off'}:
             continue
-
-        lyric = n.get("lyric", "")
-        # SoulX-Singer convention mapping from lyric token to note_type/text.
-        if not lyric:
-            note_type = 2
-            text = "啦"
-        elif lyric == "<SP>":
-            note_type = 1
-            text = "<SP>"
-        elif lyric == "-":
-            note_type = 3
-            text = raw_notes[idx - 1].get("lyric", "-") if idx > 0 else "-"
+        key = (msg.channel, msg.note)
+        if msg.type == 'note_on' and msg.velocity > 0:
+            if key in active:
+                raise ValueError(f'Overlapping MIDI note {msg.note} at tick {tick}')
+            active[key] = tick
         else:
-            note_type = 2
-            text = lyric
+            if key not in active:
+                raise ValueError(f'MIDI note-off without note-on at tick {tick}')
+            start = active.pop(key)
+            if tick <= start:
+                raise ValueError(f'MIDI note has nonpositive duration at tick {start}')
+            raw_notes.append(dict(start=start, end=tick, pitch=msg.note))
+    if active:
+        raise ValueError('MIDI contains unfinished notes (missing note-off)')
+    raw_notes.sort(key=lambda n: (n['start'], n['end']))
+    for left, right in zip(raw_notes, raw_notes[1:]):
+        if right['start'] < left['end']:
+            raise ValueError(f'Overlapping/polyphonic MIDI notes near {seconds(right["start"]):.3f}s; use a monophonic vocal track')
 
-        if start_s - prev_end_s > SILENCE_THRESHOLD_SEC:
-            # Explicitly represent long gaps as <SP> notes.
-            result.append(
-                Note(
-                    start_s=prev_end_s,
-                    note_dur=start_s - prev_end_s,
-                    note_text="<SP>",
-                    note_pitch=0,
-                    note_type=1,
-                )
-            )
+    def lyric_events(events):
+        result = []
+        for tick, msg in events:
+            if msg.type != 'lyrics' or not msg.text.strip():
+                continue
+            text = msg.text
+            try:
+                text = text.encode('latin1').decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+            result.append((tick, text.strip()))
+        return result
+
+    lyrics = lyric_events(tracks[track_index])
+    if not lyrics:
+        external = [lyric_events(events) for i, events in enumerate(tracks)
+                    if i != track_index and i not in choices and lyric_events(events)]
+        if len(external) > 1:
+            raise ValueError('Multiple separate MIDI lyric tracks; move lyrics onto the selected vocal track')
+        lyrics = external[0] if external else []
+    starts = [n['start'] for n in raw_notes]
+    tolerance = max(1, mid.ticks_per_beat // 100)
+    for tick, text in lyrics:
+        index = bisect_right(starts, tick)
+        candidates = [i for i in (index - 1, index) if 0 <= i < len(raw_notes)]
+        nearest = min(candidates, key=lambda i: abs(starts[i] - tick))
+        if abs(starts[nearest] - tick) > tolerance:
+            raise ValueError(f'MIDI lyric at {seconds(tick):.3f}s has no matching note onset')
+        if 'lyric' in raw_notes[nearest]:
+            raise ValueError(f'Multiple MIDI lyrics match one note at {seconds(starts[nearest]):.3f}s')
+        if len(text.split()) != 1:
+            raise ValueError('Each MIDI lyric event must contain one syllable/word or a continuation marker (-)')
+        raw_notes[nearest]['lyric'] = text
+
+    result, previous_end, last_word, last_missing = [], 0, None, False
+    for raw in raw_notes:
+        if raw['start'] > previous_end:
+            result.append(Note(seconds(previous_end), seconds(raw['start']) - seconds(previous_end), '<SP>', 0, 1))
+            last_word = None
+        lyric = raw.get('lyric')
+        missing = not lyric
+        if missing:
+            if not allow_missing_lyrics:
+                raise ValueError(f'MIDI note at {seconds(raw["start"]):.3f}s has no lyrics; add lyrics or supply replacement lyrics')
+            text, kind = '\u5566', 2
+        elif lyric in {'<SP>', '<AP>', '<SIL>'}:
+            text, kind = lyric, 1
+        elif lyric == '-':
+            if last_word is None:
+                raise ValueError(f'Orphan MIDI continuation (-) at {seconds(raw["start"]):.3f}s')
+            text, kind, missing = last_word, 3, last_missing
         else:
-            if len(result) > 0:
-                result[-1].note_dur = start_s - result[-1].start_s
-
-        result.append(
-            Note(
-                start_s=start_s,
-                note_dur=dur_s,
-                note_text=text,
-                note_pitch=n["midi"],
-                note_type=note_type,
-            )
-        )
-        prev_end_s = end_s
-
+            text, kind = lyric, 2
+        if raw['pitch'] == 0 and kind != 1:
+            raise ValueError('MIDI pitch 0 is reserved for rests in SoulX metadata')
+        result.append(Note(seconds(raw['start']), seconds(raw['end']) - seconds(raw['start']),
+                           text, raw['pitch'] if kind != 1 else 0, kind, missing))
+        last_word = text if kind in {2, 3} else None
+        last_missing = missing
+        previous_end = raw['end']
     return result
 
 
@@ -512,6 +531,7 @@ class MidiParser:
 
     def _get_pitch_extractor(self) -> F0Extractor:
         if self.pitch_extractor is None:
+            from .f0_extraction import F0Extractor
             self.pitch_extractor = F0Extractor(
                 self.rmvpe_model_path,
                 device=self.device,
@@ -525,12 +545,13 @@ class MidiParser:
         meta_path: str,
         vocal_file: str | None = None,
         language: str = "Mandarin",
+        track_index: int | None = None,
     ) -> None:
         meta_dir = os.path.dirname(meta_path)
         if meta_dir:
             os.makedirs(meta_dir, exist_ok=True)
 
-        notes = midi2notes(midi_path)
+        notes = midi2notes(midi_path, track_index=track_index)
         pitch_extractor = self._get_pitch_extractor() if vocal_file else None
         notes2meta(
             notes,
@@ -556,6 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--midi", type=str, help="Path to MIDI file")
     parser.add_argument("--vocal", type=str, default=None, help="Path to vocal wav (optional for midi2meta)")
     parser.add_argument("--language", type=str, default="Mandarin", help="Lyric language for metadata phoneme conversion (default: Mandarin)")
+    parser.add_argument("--track", type=int, help="Zero-based vocal MIDI track index")
     parser.add_argument(
         "--meta2midi",
         action="store_true",
@@ -593,6 +615,6 @@ if __name__ == "__main__":
             parser.error(
                 "--midi2meta requires --midi and --meta"
             )
-        midi_parser.midi2meta(args.midi, args.meta, args.vocal, args.language)
+        midi_parser.midi2meta(args.midi, args.meta, args.vocal, args.language, track_index=args.track)
     else:
         parser.print_help()

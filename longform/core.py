@@ -22,21 +22,75 @@ def _number(value, name, *, positive=False):
     return value
 
 
+class NoSafeCut(ValueError):
+    """Valid input has no feasible breath-only plan under its hard cap."""
+
+
+def short_breath_candidates(f0, frame_rms, min_gap=0.3, f0_rate=50.0):
+    """Conservative fallback cuts: unvoiced AND locally quiet, never F0 alone.
+
+    Require a >=120ms zero-F0 run with >=80ms continuously 24dB below
+    nearby voiced RMS. Exclude one F0 frame at each edge; cut only at the
+    quiet interior's midpoint. This rejects tracking dropouts/consonants
+    with appreciable energy, but still needs human phrase-boundary review.
+    """
+    f0_rate = _number(f0_rate, 'f0_rate', positive=True)
+    min_gap = _number(min_gap, 'min_gap', positive=True)
+    values, energy = np.asarray(f0), np.asarray(frame_rms)
+    for array in (values, energy):
+        if (array.ndim != 1 or array.dtype.kind not in 'fiu' or
+                not np.all(np.isfinite(array)) or np.any(array < 0)):
+            raise ValueError('f0 and frame_rms must be finite nonnegative numeric vectors')
+    if energy.shape != values.shape:
+        raise ValueError('frame_rms must have one value per f0 frame')
+    voiced = values > 0
+    edges = np.flatnonzero(np.diff(np.r_[False, ~voiced, False]))
+    candidates = {}
+    context = max(1, round(f0_rate))
+    for a, b in zip(edges[::2], edges[1::2]):
+        length = (b - a) / f0_rate
+        if length < .12 - 1e-9 or length >= min_gap - 1e-9:
+            continue
+        left, right = max(0, a - context), min(len(values), b + context)
+        nearby = energy[left:right][voiced[left:right]]
+        if not len(nearby):
+            continue
+        reference = float(np.percentile(nearby, 75))
+        if reference <= 1e-8:
+            continue
+        quiet = energy[a + 1:b - 1] <= reference * 10 ** (-24 / 20)
+        runs = np.flatnonzero(np.diff(np.r_[False, quiet, False]))
+        spans = [(a + 1 + x, a + 1 + y) for x, y in zip(runs[::2], runs[1::2])
+                 if (y - x) / f0_rate >= .08 - 1e-9]
+        if not spans:
+            continue
+        start, end = max(spans, key=lambda span: (span[1] - span[0],
+                                                 -abs(sum(span) - a - b)))
+        cut = (start + end) / (2 * f0_rate)
+        candidates[cut] = dict(kind='unvoiced_low_energy', gap_start=a / f0_rate,
+                               gap_end=b / f0_rate, quiet_start=start / f0_rate,
+                               quiet_end=end / f0_rate)
+    return candidates
+
+
 def plan_segments(f0, duration, max_seconds=28.0, min_seconds=8.0,
-                  min_gap=0.3, f0_rate=50.0) -> list[dict]:
+                  min_gap=0.3, f0_rate=50.0, frame_rms=None) -> list[dict]:
     """Return contiguous windows covering exactly ``[0, duration]``.
 
     Positive F0 samples are voiced; each sample describes [i/rate, (i+1)/rate).
-    Only zero runs of at least ``min_gap`` are cuttable. Input must cover the
-    duration to within one F0 frame (a missing rounding frame repeats the last).
+    Without audio evidence only zero runs of at least ``min_gap`` are cuttable.
+    Optional aligned ``frame_rms`` permits conservative short-breath fallbacks;
+    plans minimize their use before the usual length/count/midpoint preferences.
+    Input must cover the duration to within one F0 frame (a missing rounding
+    frame repeats the last).
     ``max_seconds`` is hard; ``min_seconds`` is a soft preference, not a reason
     to discard short intros/outros. A global shortest-path search minimizes short-window
     deficit, then window count, then distance from gap midpoints. Gap edges
-    are safe fallbacks; long silences may contain additional cuts. No voiced
-    span, including glitches shorter than min_gap, is split. An impossible
-    phrase raises ValueError with its interval rather than losing audio.
+    are safe fallbacks; long silences may contain additional cuts. No positive-F0
+    span is split; short F0 glitches alone never permit a cut. An impossible
+    phrase raises NoSafeCut (a ValueError) with its interval rather than losing audio.
 
-    ``boundary`` describes the END of each window: breath, silence, or end.
+    ``boundary`` describes the END: breath, short_breath, silence, or end.
     ``voiced`` means at least one positive F0 frame overlaps the window.
     Empty F0 and zero duration return an empty list.
     """
@@ -65,10 +119,14 @@ def plan_segments(f0, duration, max_seconds=28.0, min_seconds=8.0,
     gaps = [(a / f0_rate, min(b / f0_rate, duration))
             for a, b in zip(edges[::2], edges[1::2])
             if min(b / f0_rate, duration) - a / f0_rate >= min_gap - 1e-9]
+    short = (short_breath_candidates(values, frame_rms, min_gap, f0_rate)
+             if frame_rms is not None else {})
+    short = {cut: evidence for cut, evidence in short.items() if 0 < cut < duration}
+    gaps = sorted(gaps + [(cut, cut) for cut in short])
     cursor = 0.0
     for start, end in gaps + [(duration, duration)]:
         if start - cursor > max_seconds + 1e-9:
-            raise ValueError(f"No safe cut: voiced phrase interval [{cursor:g}, {start:g}] "
+            raise NoSafeCut(f"No safe cut: voiced phrase interval [{cursor:g}, {start:g}] "
                              f"exceeds max_seconds={max_seconds:g}")
         cursor = end
     # Gap edges are fallback cuts: they guarantee that a feasible phrase is
@@ -83,7 +141,9 @@ def plan_segments(f0, duration, max_seconds=28.0, min_seconds=8.0,
                 nodes[point] = (abs(point - middle) / max(b - a, 1e-9),
                                 "silence" if b - a >= min_seconds else "breath")
     candidates = sorted(nodes)
-    costs = [(0.0, 0, 0.0)] + [None] * (len(candidates) - 1)
+    # Prefer fewer short breaths, then longer evidenced gaps. A feasible
+    # conventional plan (zero short breaths) is therefore unchanged.
+    costs = [(0, 0.0, 0.0, 0, 0.0)] + [None] * (len(candidates) - 1)
     previous = [-1] * len(candidates)
     for j, end in enumerate(candidates[1:], 1):
         for i in range(j - 1, -1, -1):
@@ -92,12 +152,15 @@ def plan_segments(f0, duration, max_seconds=28.0, min_seconds=8.0,
                 break
             if costs[i] is None:
                 continue
-            score = (costs[i][0] + max(0.0, min_seconds - length),
-                     costs[i][1] + 1, costs[i][2] + nodes[end][0])
+            evidence = short.get(end)
+            score = (costs[i][0] + int(evidence is not None),
+                     costs[i][1] + (1 / (evidence['gap_end'] - evidence['gap_start']) if evidence else 0),
+                     costs[i][2] + max(0.0, min_seconds - length),
+                     costs[i][3] + 1, costs[i][4] + nodes[end][0])
             if costs[j] is None or score < costs[j]:
                 costs[j], previous[j] = score, i
     if costs[-1] is None:
-        raise ValueError(f"No safe cut in interval [0, {duration}]")
+        raise NoSafeCut(f"No safe cut in interval [0, {duration}]")
     cuts = []
     index = len(candidates) - 1
     while index >= 0:
@@ -105,7 +168,8 @@ def plan_segments(f0, duration, max_seconds=28.0, min_seconds=8.0,
         index = previous[index]
     cuts.reverse()
     return [dict(id=f"{i + 1:04d}", start=a, end=b,
-                 boundary=nodes[b][1],
+                 boundary='short_breath' if b in short else nodes[b][1],
+                 **({'cut_evidence': short[b]} if b in short else {}),
                  voiced=bool(np.any(voiced[int(a * f0_rate):int(np.ceil(b * f0_rate))])))
             for i, (a, b) in enumerate(zip(cuts, cuts[1:]))]
 

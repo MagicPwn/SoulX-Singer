@@ -2,6 +2,7 @@ import random
 import sys
 import traceback
 import gc
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -136,6 +137,107 @@ def _trim_and_save_audio(src_audio_path: str, dst_wav_path: Path, max_sec: int,
         audio_data = audio_data[:int(max_sec * sr)]
     dst_wav_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(dst_wav_path, audio_data, sr)
+
+
+def _select_prompt_reference(prompt_wav_path: Path, prompt_f0_path: Path,
+                             output_dir: Path, *, frame_rate: int = 50) -> tuple[Path, Path, dict]:
+	"""Select a voiced reference crop for SVC without changing short inputs.
+
+	The legacy SVC UI used the first 30 seconds verbatim. That often includes
+	intro silence or accompaniment and makes the cloned timbre unstable. The
+	preprocessor already produces a 50 Hz F0 track, so use it to choose a dense
+	voiced window while keeping the original files as an audit trail. Invalid or
+	very short tracks are left untouched and reported in ``quality``.
+	"""
+	prompt_wav_path, prompt_f0_path, output_dir = map(Path, (prompt_wav_path, prompt_f0_path, output_dir))
+	output_dir.mkdir(parents=True, exist_ok=True)
+	quality = {"source_duration_seconds": 0.0, "selected_duration_seconds": 0.0,
+	           "frame_rate_hz": int(frame_rate), "selected_start_seconds": 0.0,
+	           "voiced_ratio": 0.0, "cropped": False, "issues": []}
+	try:
+		f0 = np.asarray(np.load(str(prompt_f0_path), allow_pickle=False), dtype=np.float32)
+		if f0.ndim != 1 or not np.isfinite(f0).all() or np.any(f0 < 0):
+			raise ValueError("invalid F0 track")
+		info = sf.info(str(prompt_wav_path))
+		audio_duration = float(info.frames / info.samplerate) if info.samplerate else 0.0
+		frame_count = min(len(f0), int(np.ceil(audio_duration * frame_rate)))
+		if frame_count <= 0:
+			raise ValueError("empty prompt audio/F0")
+		f0 = f0[:frame_count]
+		duration = min(audio_duration, frame_count / frame_rate)
+		quality.update(source_duration_seconds=duration, selected_duration_seconds=duration,
+					  voiced_ratio=float(np.mean(f0 > 0)))
+		if duration < 8.0:
+			quality["issues"].append("short_reference")
+		else:
+			voiced = f0 > 0
+			transitions = np.flatnonzero(np.diff(np.r_[False, voiced, False]))
+			candidates = []
+			for left, right in zip(transitions[::2], transitions[1::2]):
+				run_length = (right - left) / frame_rate
+				if run_length < 8.0:
+					continue
+				length = min(12.0, run_length)
+				for start in {left, max(left, right - int(round(length * frame_rate))),
+							  left + max(0, (right - left - int(round(length * frame_rate))) // 2)}:
+					end = min(right, start + int(round(length * frame_rate)))
+					if end - start >= int(round(8.0 * frame_rate)):
+						candidates.append((float(np.mean(f0[start:end] > 0)), start, end))
+			if candidates:
+				_, start, end = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
+				with sf.SoundFile(str(prompt_wav_path)) as stream:
+					stream.seek(round(start / frame_rate * stream.samplerate))
+					audio = stream.read(round((end - start) / frame_rate * stream.samplerate),
+									   dtype="float32", always_2d=True)
+				selected_wav = output_dir / "selected_prompt.wav"
+				selected_f0 = output_dir / "selected_prompt_f0.npy"
+				sf.write(str(selected_wav), audio, info.samplerate, subtype="FLOAT")
+				np.save(str(selected_f0), f0[start:end])
+				quality.update(selected_duration_seconds=float((end - start) / frame_rate),
+							  selected_start_seconds=float(start / frame_rate), cropped=True)
+			else:
+				quality["issues"].append("no_continuous_voiced_window")
+		duration = quality["selected_duration_seconds"]
+		if duration < 8.0 and "short_reference" not in quality["issues"]:
+			quality["issues"].append("short_reference")
+		return (selected_wav if quality["cropped"] else prompt_wav_path,
+				selected_f0 if quality["cropped"] else prompt_f0_path, quality)
+	except Exception as exc:
+		quality["issues"].append(str(exc))
+		return prompt_wav_path, prompt_f0_path, quality
+
+
+def _f0_diagnostics(f0_path: Path, *, frame_rate: int = 50) -> dict:
+	"""Return lightweight F0 diagnostics for the SVC target/reference inputs."""
+	f0_path = Path(f0_path)
+	values = np.asarray(np.load(str(f0_path), allow_pickle=False), dtype=np.float32)
+	if values.ndim != 1 or not np.isfinite(values).all() or np.any(values < 0):
+		raise ValueError("invalid F0 track")
+	voiced = values > 0
+	active = values[voiced]
+	adjacent = voiced[:-1] & voiced[1:]
+	if np.any(adjacent):
+		left, right = values[:-1][adjacent], values[1:][adjacent]
+		ratio = np.maximum(left, right) / np.maximum(np.minimum(left, right), 1e-6)
+		jump_mask = (ratio >= 1.8) | (ratio <= 1 / 1.8)
+	else:
+		jump_mask = np.zeros(0, dtype=bool)
+	jump_count = int(np.sum(jump_mask))
+	adjacent_count = int(np.sum(adjacent))
+	result = dict(frame_rate_hz=int(frame_rate), total_frames=int(len(values)),
+				  voiced_ratio=float(np.mean(voiced)) if len(values) else 0.0,
+				  median_hz=float(np.median(active)) if len(active) else 0.0,
+				  min_hz=float(np.percentile(active, 1)) if len(active) else 0.0,
+				  max_hz=float(np.percentile(active, 99)) if len(active) else 0.0,
+				  octave_jump_frames=jump_count,
+				  octave_jump_ratio=(jump_count / adjacent_count if adjacent_count else 0.0))
+	issues = []
+	if result["voiced_ratio"] < 0.05:
+		issues.append("low_voicing")
+	if jump_count >= 3 and result["octave_jump_ratio"] >= 0.01:
+		issues.append("octave_jumps")
+	result["issues"] = issues
+	return result
 
 def _usage_md() -> str:
 	return "\n\n".join([
@@ -333,6 +435,18 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		if not prompt_ok or prompt_wav is None or prompt_f0 is None:
 			print(prompt_msg, file=sys.stderr, flush=True)
 			raise gr.Error(f"Prompt preprocessing failed: {prompt_msg or 'No usable audio/pitch output.'}")
+		# Use a dense voiced crop for timbre conditioning when the supplied
+		# reference is a long continuous take. Keep the original preprocessor
+		# outputs so users can audit or retry with a different crop.
+		prompt_wav, prompt_f0, prompt_quality = _select_prompt_reference(
+			prompt_wav, prompt_f0, session_base / "transcriptions" / "prompt")
+		(session_base / "transcriptions" / "prompt" / "quality.json").write_text(
+			json.dumps(prompt_quality, ensure_ascii=False, indent=2), encoding="utf-8")
+		if prompt_quality.get("issues"):
+			print(f"Prompt reference quality: {', '.join(prompt_quality['issues'])}",
+				  file=sys.stderr, flush=True)
+			gr.Warning("Prompt reference quality requires review: " +
+					   ", ".join(prompt_quality["issues"]))
 
 		target_ok, target_msg, target_wav, target_f0 = get_app_state().run_preprocess(
 			audio_path=target_raw,
@@ -342,6 +456,16 @@ def _start_svc(prompt_audio, target_audio, prompt_vocal_sep, target_vocal_sep, a
 		if not target_ok or target_wav is None or target_f0 is None:
 			print(target_msg, file=sys.stderr, flush=True)
 			raise gr.Error(f"Target preprocessing failed: {target_msg or 'No usable audio/pitch output.'}")
+		try:
+			target_quality = _f0_diagnostics(target_f0)
+			(target_f0.parent / "quality.json").write_text(
+				json.dumps(target_quality, ensure_ascii=False, indent=2), encoding="utf-8")
+			if target_quality.get("issues"):
+				gr.Warning("Target F0 quality requires review: " +
+						   ", ".join(target_quality["issues"]))
+		except Exception as exc:
+			# Do not hide a valid model run solely because diagnostics failed.
+			print(f"Target F0 diagnostics unavailable: {exc}", file=sys.stderr, flush=True)
 
 		ok, msg, generated = get_app_state().run_svc(
 			prompt_wav_path=prompt_wav,

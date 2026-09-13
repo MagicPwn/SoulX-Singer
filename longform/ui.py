@@ -5,6 +5,8 @@ import json
 
 import gradio as gr
 
+from longform.review import input_signature, render_token, review_state
+
 GPU_QUEUE = "soulx-global-gpu"
 GPU_EVENT = dict(concurrency_id=GPU_QUEUE, concurrency_limit=1, show_progress="full")
 
@@ -122,18 +124,52 @@ class Workspace:
         segments = data["segments"]
         ids = [str(s["id"]) for s in segments]
         selected = str(selected) if selected is not None and str(selected) in ids else next(iter(ids), None)
+        cache = {}
+        reviews = {s['id']: review_state(data, s, cache) for s in segments}
         rows = [[str(s["id"]), round(float(s["start"]), 3), round(float(s["end"]), 3),
                  s.get("boundary", ""), bool(s.get("voiced", True)), s.get("status", "pending"),
                  len(s["attempts"]) if isinstance(s.get("attempts"), list) else s.get("attempts", 0),
-                 s.get("lyrics") or "", s.get("error") or "", self._review(s)] for s in segments]
+                 s.get("lyrics") or "", s.get("error") or "", self._review(s),
+                 self._review_label(reviews[s['id']])] for s in segments]
         completed = sum(s.get("status") in ("completed", "done", "skipped", "silent") for s in segments)
         failed = sum(s.get("status") == "failed" for s in segments)
+        review_count = sum(bool(s.get("needs_manual_review")) for s in segments)
+        prompt_quality = data.get("prompt", {}).get("quality", {}) if isinstance(data.get("prompt"), dict) else {}
+        pitch_quality = data.get("pitch_quality", {}) if isinstance(data.get("pitch_quality"), dict) else {}
         status = (f"{data.get('id', path.parent.name)} · {float(data.get('duration', 0)):.1f}s · "
-                  f"完成 / complete {completed}/{len(segments)} · 失败 / failed {failed}\n"
+                  f"已渲染 / rendered {completed}/{len(segments)} · 失败 / failed {failed}\n"
+                  f"人工验收 / accepted {sum(v == 'accepted' for v in reviews.values())}/{sum(s['voiced'] for s in segments)} · "
+                  f"当前导出 / Export: {data.get('output_review_status', 'draft')}\n"
                   f"状态 / Status: {data.get('status', 'prepared')} · 阶段 / Phase: {data.get('phase', '')}\n"
                   "运行剩余会跳过已完成片段；更改歌词后请保存并重新生成。 / Resume skips completed segments; save and regenerate edited lyrics.")
+        if review_count:
+            status += (f"\n需要人工复核 / Manual review required for {review_count} segment(s); "
+                       "check lyric alignment and F0 findings in the review column.")
+        if prompt_quality.get("short_reference"):
+            status += (f"\nReference is {float(prompt_quality.get('duration_seconds', 0)):.1f}s; "
+                       "8-15s clean continuous vocals are recommended for stable timbre.")
+        if prompt_quality.get("issues"):
+            status += (f"\nReference quality requires review ({', '.join(prompt_quality['issues'])}); "
+                       f"RMS {float(prompt_quality.get('rms_db', 0)):.1f} dB, "
+                       f"voiced {float(prompt_quality.get('voiced_ratio', 0)):.1%}.")
+        separation_quality = data.get("separation_quality", {}) if isinstance(data.get("separation_quality"), dict) else {}
+        if separation_quality.get("issues"):
+            status += (f"\nSeparation review ({', '.join(separation_quality['issues'])}); "
+                       f"vocal/accompaniment correlation {float(separation_quality.get('vocal_accompaniment_correlation', 0)):.2f}.")
+        reference_quality = data.get("reference_quality", {}) if isinstance(data.get("reference_quality"), dict) else {}
+        if reference_quality.get("issues"):
+            status += f"\nReference separation review ({', '.join(reference_quality['issues'])})."
+        if pitch_quality.get("low_voiced_ratio"):
+            status += (f"\nF0 voiced ratio is only {float(pitch_quality.get('voiced_ratio', 0)):.1%}; "
+                       "check vocal separation or the source recording before synthesis.")
+        if pitch_quality.get("likely_octave_errors"):
+            status += (f"\nF0 has {int(pitch_quality.get('octave_jump_frames', 0))} likely octave jumps; "
+                       "improve vocal separation or correct F0 before accepting the render.")
+        status += self._short_breath_notice(segments)
         if data.get("error"):
-            status += f"\n错误 / Error: {data['error']}\n{self._cut_hint()}"
+            status += f"\n错误 / Error: {data['error']}"
+            if self._is_no_safe_cut(data['error']):
+                status += f"\n{self._cut_hint()}"
         choices = [(f"{s['id']} · {float(s['start']):.1f}–{float(s['end']):.1f}s · {s.get('status', 'pending')}", str(s["id"])) for s in segments]
         preview = self._preview(path, self._segment(data, selected)) if selected is not None else (None, None, "")
         final = self._audio(data.get("output_path"), path)
@@ -147,29 +183,47 @@ class Workspace:
 
     @staticmethod
     def _review(segment):
-        messages = [segment.get("warning"), segment.get("review")]
+        messages = [segment.get("warning"), segment.get("review"), segment.get("review_reasons")]
         for key in ("base_metadata", "metadata"):
             metadata = segment.get(key) or {}
             messages.extend([metadata.get("review"), metadata.get("lyric_alignment")])
         return " | ".join(dict.fromkeys(json.dumps(m, ensure_ascii=False) if isinstance(m, (dict, list))
                                         else str(m) for m in messages if m))
 
+    @staticmethod
+    def _is_no_safe_cut(error):
+        text = str(error).lower()
+        return "no safe cut" in text or ("no safe" in text and "cut" in text)
+
+    def _short_breath_notice(self, segments):
+        count = sum(s.get("boundary") == "short_breath" for s in segments)
+        if not count:
+            return ""
+        return (f"\nInfo: {count} short_breath fallback cut(s). Listen to each boundary; "
+                "acoustic gaps do not guarantee sentence boundaries.")
+
     def _cut_hint(self):
         if self.mode == "svc":
-            return "SVC 分段须小于 30 秒；检查换气间隔或使用原生 SVC 模式。 / SVC segments must be below 30s; inspect breath gaps or use native SVC."
-        return "无安全切点时可尝试上限 40 秒（最高 60 秒）或检查换气间隔；不会强行切断长句。 / For no safe cut, try 40s (up to 60s) or inspect breath gaps."
+            return ("Resume the cached project after upgrading and review the audio. "
+                    "SVC segments must be below 30s; inspect breath gaps or use native SVC.")
+        return ("Resume the cached project after upgrading and review the audio. "
+                "For no safe cut, try 40s (up to 60s) or inspect breath gaps.")
 
     def _project_call(self, operation, *args, **kwargs):
         try:
             return operation(*args, **kwargs)
         except Exception as exc:
-            # Failed preparation has a durable manifest too: return it to the UI,
-            # not merely an error toast that loses the only resume path.
             if getattr(exc, "manifest_path", None):
                 path = self._manifest_path(exc.manifest_path)
-                gr.Warning(f"任务未完成，已保留项目 / Incomplete project saved: {exc}\n{self._cut_hint()}")
+                message = f"Incomplete project saved: {exc}"
+                if self._is_no_safe_cut(exc):
+                    message += f"\n{self._cut_hint()}"
+                gr.Warning(message)
                 return str(path)
-            raise gr.Error(f"操作失败 / Operation failed: {exc}\n{self._cut_hint()}") from exc
+            message = f"Operation failed: {exc}"
+            if self._is_no_safe_cut(exc):
+                message += f"\n{self._cut_hint()}"
+            raise gr.Error(message) from exc
 
     @staticmethod
     def _invoke(operation, *args, **kwargs):
@@ -178,15 +232,17 @@ class Workspace:
         except gr.Error:
             raise
         except Exception as exc:
-            raise gr.Error(
-                f"操作失败 / Operation failed: {exc}\n"
-                "项目可刷新后继续；无安全切点时可增大片段上限（密集长句建议 40 秒，最高 60 秒）"
-                "或检查换气间隔。不会强行切断长句。 / Refresh to resume. If no safe cut exists, "
-                "increase segment maximum (try 40s, up to 60s) or inspect the breath-gap setting."
-            ) from exc
+            message = f"Operation failed: {exc}"
+            if Workspace._is_no_safe_cut(exc):
+                message += ("\nIf no safe cut exists, inspect the audio and breath-gap setting; "
+                            "SVS may try a 40s segment cap.")
+            raise gr.Error(message) from exc
 
     def prepare(self, source, lyrics_text="", lyric_file=None, reference=None,
                 max_seconds=28.0, min_gap=0.3, language="Mandarin", separate=True,
+                metadata_file=None, reference_is_vocal=False, midi_file=None, midi_track="auto",
+                reference_start=None, reference_end=None,
+                dereverb=False, reference_dereverb=False,
                 progress=gr.Progress(track_tqdm=True)):
         if not source:
             raise gr.Error("请上传完整目标歌曲 / Upload the full target song.")
@@ -195,10 +251,26 @@ class Workspace:
         if self.mode == "svc" and float(max_seconds) >= 30:
             raise gr.Error(self._cut_hint())
         progress(0.03, desc="准备整曲 / Preparing full song; first model load may take time")
-        result = self._project_call(self._service().prepare_project, source=source,
-            lyrics_text=lyrics_text or "", lyric_file=None if lyrics_text else lyric_file,
-            reference=reference, max_seconds=float(max_seconds), min_gap=float(min_gap),
-            mode=self.mode, language=language, separate=bool(separate))
+        prepare_kwargs = dict(source=source, lyrics_text=lyrics_text or "",
+            lyric_file=None if lyrics_text else lyric_file, reference=reference,
+            max_seconds=float(max_seconds), min_gap=float(min_gap), mode=self.mode,
+            language=language, separate=bool(separate))
+        if reference_start not in (None, "") or reference_end not in (None, ""):
+            prepare_kwargs["reference_start"] = float(reference_start)
+            prepare_kwargs["reference_end"] = float(reference_end)
+        if dereverb:
+            prepare_kwargs["dereverb"] = True
+        if reference_dereverb:
+            prepare_kwargs["reference_dereverb"] = True
+        if metadata_file:
+            prepare_kwargs["metadata_file"] = metadata_file
+        if midi_file:
+            prepare_kwargs["midi_file"] = midi_file
+            if midi_track not in (None, "auto"):
+                prepare_kwargs["midi_track"] = int(midi_track)
+        if reference and reference_is_vocal:
+            prepare_kwargs["reference_separate"] = False
+        result = self._project_call(self._service().prepare_project, **prepare_kwargs)
         progress(1, desc="分段就绪 / Segments ready")
         return self.load(result)
 
@@ -215,7 +287,7 @@ class Workspace:
         return self.load(result, segment_id)
 
     def run(self, manifest_path, seed=42, n_steps=32, cfg=3.0, auto_shift=False,
-            pitch_shift=0, control="melody", mix=True, progress=gr.Progress(track_tqdm=True)):
+            pitch_shift=0, control="score", mix=True, progress=gr.Progress(track_tqdm=True)):
         return self._run(manifest_path, None, seed, n_steps, cfg, auto_shift,
                          pitch_shift, control, mix, False, progress)
 
@@ -227,7 +299,7 @@ class Workspace:
         return self.load(result, segment_id)
 
     def regenerate(self, manifest_path, segment_id, lyrics_text, seed=42, n_steps=32,
-                   cfg=3.0, auto_shift=False, pitch_shift=0, control="melody", mix=True,
+                   cfg=3.0, auto_shift=False, pitch_shift=0, control="score", mix=True,
                    progress=gr.Progress(track_tqdm=True)):
         # Save and regenerate are one queued action; another GPU task cannot interleave.
         path = self.save(manifest_path, segment_id, lyrics_text)[0] if self.mode == "svs" else manifest_path
@@ -235,17 +307,176 @@ class Workspace:
                          pitch_shift, control, mix, True, progress)
 
     def regenerate_all(self, manifest_path, confirm=False, seed=42, n_steps=32, cfg=3.0,
-                       auto_shift=False, pitch_shift=0, control="melody", mix=True,
+                       auto_shift=False, pitch_shift=0, control="score", mix=True,
                        progress=gr.Progress(track_tqdm=True)):
         if not confirm:
             raise gr.Error("请确认重新生成全部片段 / Confirm regenerating all segments first.")
         return self._run(manifest_path, None, seed, n_steps, cfg, auto_shift,
                          pitch_shift, control, mix, True, progress)
 
-    def merge(self, manifest_path, mix=True, progress=gr.Progress(track_tqdm=True)):
+    def compare(self, manifest_path, segment_id, seed=42, n_steps=32, cfg=3.0,
+                auto_shift=False, pitch_shift=0, include_original=False, progress=gr.Progress(track_tqdm=True)):
+        path, _ = self._read(manifest_path)
+        progress(0.05, desc="Generating Melody and Score A/B variants")
+        result = self._project_call(self._service().compare_segment, str(path), str(segment_id),
+                                    seed=int(seed), n_steps=int(n_steps), cfg=float(cfg),
+                                    auto_shift=bool(auto_shift), pitch_shift=int(pitch_shift),
+                                    include_original=bool(include_original))
+        progress(1, desc="A/B variants saved")
+        return self.load(result, segment_id)
+
+    @staticmethod
+    def _review_label(state):
+        return {'silent': '静音 / Silent', 'needs_alignment': '待对齐复核 / Review alignment',
+                'needs_review': '待 F0/输入复核 / Review inputs', 'needs_listening': '待试听 / Listen',
+                'accepted': '已验收 / Accepted'}[state]
+
+    def review(self, manifest_path, segment_id):
+        if not manifest_path or segment_id is None:
+            return '', {}
+        _, data = self._read(manifest_path)
+        segment = self._segment(data, segment_id)
+        cache = {}
+        token = render_token(data, segment, cache)
+        text = self._review_label(review_state(data, segment, cache))
+        if segment['voiced'] and not token:
+            text += '\n当前音频尚无有效生成记录；请生成后试听验收。 / Generate a current render before acceptance.'
+        return text, dict(segment_id=str(segment_id), inputs=input_signature(data, segment, cache), render=token)
+
+    def set_review(self, manifest_path, segment_id, action, loaded):
+        if not loaded or loaded.get('segment_id') != str(segment_id):
+            raise gr.Error('请刷新当前片段后复核 / Refresh this segment before review.')
+        if action == 'accept' and not loaded.get('render'):
+            raise gr.Error('请生成并试听当前音频 / Generate and listen to the current audio first.')
+        path, _ = self._read(manifest_path)
+        result = self._invoke(self._service().review_segment, str(path), str(segment_id), action,
+            expected_inputs=loaded['inputs'], expected_render=loaded.get('render'))
+        return self.load(result, segment_id)
+
+    def comparisons(self, manifest_path, segment_id):
+        if self.mode != 'svs' or not manifest_path or segment_id is None:
+            return gr.update(choices=[], value=None), None, None, None, None, None, ''
+        path, data = self._read(manifest_path)
+        segment = self._segment(data, segment_id)
+        history = [c for c in data.get('comparison_history', [])
+                   if c.get('segment_id') == str(segment_id) and c.get('variants')]
+        latest = history[-1]['variants'] if history else {}
+        paths = [self._audio(latest.get(key, {}).get('audio_path'), path)
+                 if latest.get(key, {}).get('status') == 'completed' else None
+                 for key in ('current_melody', 'current_score', 'original_melody', 'original_score')]
+        current = input_signature(data, segment)
+        choices = [(f"{c['id'][:8]} · {v['control']} · {v['lyrics'][:35]}", f"{c['id']}:{key}")
+            for c in reversed(history) if c.get('input_signature') == current
+            for key, v in c['variants'].items() if v['status'] == 'completed' and v['lyric_variant'] == 'current']
+        selected = choices[0][1] if choices else None
+        preview, details = self.comparison_preview(str(path), segment_id, selected)
+        if history and history[-1].get('error'):
+            details += '\n' + history[-1]['error']
+        return gr.update(choices=choices, value=selected), *paths, preview, details
+
+    def comparison_preview(self, manifest_path, segment_id, selected):
+        if not selected:
+            return None, '先保存歌词/乐谱，再生成比较。原词组使用原始对齐，仅供诊断试听。'
+        path, data = self._read(manifest_path)
+        comparison_id, key = selected.split(':', 1)
+        comparison = next((c for c in data.get('comparison_history', [])
+            if c.get('id') == comparison_id and c.get('segment_id') == str(segment_id)), None)
+        variant = (comparison or {}).get('variants', {}).get(key)
+        if not variant or variant['status'] != 'completed':
+            raise gr.Error('请选择已生成的比较版本 / Select a completed variant.')
+        return self._audio(variant['audio_path'], path), (
+            f"歌词 / Lyrics: {variant['lyrics']}\n{json.dumps(variant['parameters'], ensure_ascii=False)}\n"
+            '采用后请试听验收并重新合并整曲。 / Accept after listening, then assemble the song again.')
+
+    def adopt(self, manifest_path, segment_id, selected):
+        if not selected:
+            raise gr.Error('请选择当前歌词的比较版本 / Select a comparison of the current lyrics.')
+        path, _ = self._read(manifest_path)
+        comparison_id, key = selected.split(':', 1)
+        result = self._invoke(self._service().adopt_comparison, str(path), str(segment_id), comparison_id, key)
+        return self.load(result, segment_id)
+
+    def score(self, manifest_path, segment_id):
+        if self.mode != 'svs' or not manifest_path or segment_id is None:
+            return [], {}
+        _, data = self._read(manifest_path)
+        segment = self._segment(data, segment_id)
+        meta = segment.get('metadata') or dict(text='<SP>', note_pitch='0', note_type='1',
+                                               duration=str(segment['end'] - segment['start']))
+        rows = [[word, int(pitch), float(duration), int(kind)] for word, pitch, duration, kind in
+                zip(meta['text'].split(), meta['note_pitch'].split(),
+                    meta['duration'].split(), meta['note_type'].split())]
+        return rows, dict(segment_id=str(segment_id), revision=segment.get('revision', 0))
+
+    def save_score(self, manifest_path, segment_id, rows, loaded):
+        if not loaded or loaded.get('segment_id') != str(segment_id):
+            raise gr.Error('请先刷新当前片段的乐谱 / Reload this segment score before saving.')
+        path, _ = self._read(manifest_path)
+        if hasattr(rows, 'tolist'):
+            rows = rows.tolist()
+        result = self._invoke(self._service().update_segment_score, str(path), str(segment_id),
+                              notes=rows, expected_revision=loaded['revision'])
+        return self.load(result, segment_id)
+
+    def import_score(self, manifest_path, segment_id, file_path, track, loaded):
+        if not file_path:
+            raise gr.Error('请上传当前片段的 MIDI 或 JSON / Upload a segment MIDI or JSON.')
+        if not loaded or loaded.get('segment_id') != str(segment_id):
+            raise gr.Error('请先刷新当前片段 / Reload this segment before importing.')
+        path, _ = self._read(manifest_path)
+        kwargs = dict(expected_revision=loaded['revision'])
+        suffix = Path(file_path).suffix.lower()
+        if suffix == '.json':
+            kwargs['metadata_file'] = file_path
+        elif suffix in {'.mid', '.midi'}:
+            kwargs.update(midi_file=file_path, midi_track=None if track in (None, 'auto') else int(track))
+        else:
+            raise gr.Error('Require MIDI or metadata JSON')
+        result = self._invoke(self._service().update_segment_score, str(path), str(segment_id), **kwargs)
+        return self.load(result, segment_id)
+
+    def export_score(self, manifest_path, segment_id):
+        path, _ = self._read(manifest_path)
+        export = self._service().export_segment_score
+        return tuple(self._invoke(export, str(path), str(segment_id), file_format=kind)
+                     for kind in ('json', 'midi'))
+
+    def f0(self, manifest_path, segment_id):
+        if self.mode not in {'svs', 'svc'} or not manifest_path or segment_id is None:
+            return '', {}
+        _, data = self._read(manifest_path)
+        segment = self._segment(data, segment_id)
+        quality = segment.get('pitch_quality') or {}
+        jumps = quality.get('octave_jump_indices', [])
+        dropouts = quality.get('voicing_dropout_indices', [])
+        summary = (f"F0 50Hz · {quality.get('total_frames', 0)} frames · voiced {float(quality.get('voiced_ratio', 0)):.1%}\n"
+                   f"range {float(quality.get('min_hz', 0)):.1f}–{float(quality.get('max_hz', 0)):.1f} Hz · "
+                   f"octave jumps: {len(jumps)} · isolated dropouts: {len(dropouts)}\n"
+                   f"jump frame(s): {', '.join(map(str, jumps[:20])) or 'none'}\n"
+                   f"dropout frame(s): {', '.join(map(str, dropouts[:20])) or 'none'}")
+        return summary, dict(segment_id=str(segment_id), revision=segment.get('revision', 0))
+
+    def export_f0(self, manifest_path, segment_id):
+        path, _ = self._read(manifest_path)
+        return self._invoke(self._service().export_segment_f0, str(path), str(segment_id))
+
+    def import_f0(self, manifest_path, segment_id, file_path, loaded):
+        if not file_path:
+            raise gr.Error('请上传 F0 JSON / Upload an F0 JSON file.')
+        if not loaded or loaded.get('segment_id') != str(segment_id):
+            raise gr.Error('请先刷新当前片段 / Reload this segment before importing F0.')
+        path, _ = self._read(manifest_path)
+        result = self._invoke(self._service().update_segment_f0, str(path), str(segment_id),
+                              json_file=file_path, expected_revision=loaded['revision'])
+        return self.load(result, segment_id)
+
+    def merge(self, manifest_path, mix=True, output_sample_rate='auto', progress=gr.Progress(track_tqdm=True)):
         path, _ = self._read(manifest_path)
         progress(0.1, desc="合并整曲 / Assembling full timeline")
-        output = self._invoke(self._service().assemble_project, str(path), mix=bool(mix))
+        kwargs = dict(mix=bool(mix))
+        if output_sample_rate not in (None, '', 'auto'):
+            kwargs['output_sample_rate'] = int(output_sample_rate)
+        output = self._invoke(self._service().assemble_project, str(path), **kwargs)
         final = self._audio(output, path)
         if final is None:
             raise gr.Error("合并未生成文件 / Assembly returned no output file.")
@@ -254,6 +485,14 @@ class Workspace:
         progress(1, desc="整曲已就绪 / Full song ready")
         return tuple(result)
 
+    def export_accepted(self, manifest_path, mix=True, output_sample_rate='auto'):
+        path, _ = self._read(manifest_path)
+        kwargs = dict(mix=bool(mix), require_accepted=True)
+        if output_sample_rate not in (None, '', 'auto'):
+            kwargs['output_sample_rate'] = int(output_sample_rate)
+        self._invoke(self._service().assemble_project, str(path), **kwargs)
+        return self.load(str(path))
+
 
 def read_lyrics_upload(path):
     """Document import is CPU-only; audio upload never triggers preparation."""
@@ -261,6 +500,15 @@ def read_lyrics_upload(path):
         return ""
     from longform.lyrics import read_lyrics
     return Workspace._invoke(read_lyrics, path)
+
+
+def read_midi_tracks(path):
+    choices = [("自动选择唯一音符轨 / Auto", "auto")]
+    if path and Path(path).suffix.lower() in {'.mid', '.midi'}:
+        from preprocess.tools.midi_parser import midi_tracks
+        for track in Workspace._invoke(midi_tracks, path):
+            choices.append((f"{track['index']}: {track['name']} · {track['notes']} notes", str(track['index'])))
+    return gr.update(choices=choices, value="auto")
 
 
 def render_workspace(root, mode="svs"):
@@ -291,12 +539,24 @@ def render_workspace(root, mode="svs"):
         with gr.Accordion("可选参考音色 / Optional voice reference", open=False, elem_id="long-reference-options"):
             reference = gr.Audio(label="参考音色 / Reference voice · 短采样，不是目标整曲", type="filepath",
                                  sources=["upload"], editable=False)
-            gr.Markdown("留空从原曲选择；或上传不超过 30 秒的干净人声。 / Leave empty to select from the song, or supply a clean reference up to 30s.")
+            gr.Markdown("留空从原曲选择；换音色时请上传目标歌手的干净人声，推荐 8–15 秒。 / Leave empty to select from the song; supply 8–15s of clean target-singer vocals to change timbre.")
+            reference_is_vocal = gr.Checkbox(value=False, label="参考已是纯人声 / Reference is already isolated vocal")
+            with gr.Row():
+                reference_dereverb = gr.Checkbox(value=False, label="参考去混响 / Dereverb reference")
+            with gr.Row():
+                reference_start = gr.Number(value=None, label="参考起点（秒） / Reference start", minimum=0)
+                reference_end = gr.Number(value=None, label="参考终点（秒） / Reference end", minimum=0)
+            gr.Markdown("可选：指定参考人声区间。必须同时填写，区间最长 28 秒且至少含有声片段；留空则自动选择。 / Optional manual interval; fill both fields, max 28s and must contain voiced frames.")
+        manual_metadata = gr.File(label="Corrected metadata JSON (optional)", type="filepath", file_types=[".json"], visible=mode == "svs")
+        midi_input = gr.File(label="MIDI notes/lyrics (optional)", type="filepath", file_types=[".mid", ".midi"], visible=mode == "svs")
+        midi_track = gr.Dropdown(choices=[("自动选择唯一音符轨 / Auto", "auto")], value="auto",
+                                label="MIDI 主唱轨 / Vocal track", visible=mode == "svs")
         with gr.Accordion("分段选项 / Segmentation options", open=False):
             with gr.Row():
                 max_seconds = gr.Slider(1, 60, value=28, step=1, label="每段上限（秒） / Segment maximum (s)", elem_id="long-max-seconds")
                 min_gap = gr.Slider(.05, 2, value=.3, step=.05, label="换气间隔（秒） / Minimum breath gap (s)")
                 separate = gr.Checkbox(value=True, label="分离人声与伴奏 / Separate vocals & accompaniment")
+                dereverb = gr.Checkbox(value=False, label="目标去混响 / Dereverb target (may remove breathiness)")
             gr.Markdown("默认 28 秒；密集长句可尝试 **40 秒**，最高 60 秒。无安全切点时会提示调整，不会强行切断持续演唱。 / "
                         "Default 28s; try **40s** for dense phrases, up to 60s. No forced cuts through continuous singing.")
             if mode == "svc":
@@ -311,8 +571,8 @@ def render_workspace(root, mode="svs"):
             load = gr.Button("载入 / 刷新 / Resume", scale=1)
         status = gr.Textbox(label="任务状态 / Task status", lines=3, interactive=False, elem_id="long-status")
         table = gr.Dataframe(headers=["片段 / ID", "开始 / Start", "结束 / End", "切点 / Boundary", "人声 / Voiced",
-                                     "状态 / Status", "尝试 / Attempts", "歌词 / Lyrics", "错误 / Error", "核对 / Review"],
-                             datatype=["str", "number", "number", "str", "bool", "str", "number", "str", "str", "str"],
+                                     "渲染 / Render", "尝试 / Attempts", "歌词 / Lyrics", "错误 / Error", "诊断 / Findings", "人工验收 / Review"],
+                             datatype=["str", "number", "number", "str", "bool", "str", "number", "str", "str", "str", "str"],
                              value=[], interactive=False, wrap=True, max_height=280)
         gr.Markdown("刷新只读取已保存的状态，不会启动模型。 / Resume/refresh only reads the saved project.")
     with gr.Column(elem_classes="workflow-card"):
@@ -322,9 +582,59 @@ def render_workspace(root, mode="svs"):
             source_preview = gr.Audio(label="原始片段 / Source segment", type="filepath", interactive=False)
             generated_preview = gr.Audio(label="生成片段 / Generated segment", type="filepath", interactive=False)
         segment_lyrics = gr.Textbox(label="当前片段歌词 / Segment lyrics", lines=4, interactive=mode == "svs")
+        with gr.Accordion("音符与歌词对齐 / Edit score alignment", open=False, visible=mode == "svs"):
+            gr.Markdown("按顺序编辑每个音节的音高和时长。休止写 `<SP>`、音高 0、类型 1；"
+                        "新字用类型 2，一字多音的后续音符用类型 3 并重复该字。时长总和不能超过当前片段。\n\n"
+                        "导入文件从当前片段的 **0 秒**开始计时；保存乐谱后重新生成此段。")
+            note_table = gr.Dataframe(headers=["音节 / Syllable", "MIDI 音高", "时长 / Seconds", "note_type"],
+                                      datatype=['str', 'number', 'number', 'number'], type='array',
+                                      col_count=(4, 'fixed'), value=[], interactive=True, max_height=350)
+            score_revision = gr.State({})
+            save_score = gr.Button("保存音符对齐 / Save score", variant='primary')
+            export_score = gr.Button("导出当前片段乐谱 / Export score")
+            with gr.Row():
+                score_json = gr.File(label="当前片段 JSON", interactive=False)
+                score_midi = gr.File(label="当前片段 MIDI", interactive=False)
+            score_upload = gr.File(label="导回已修正的片段乐谱 / Import edited score", type='filepath',
+                                   file_types=['.json', '.mid', '.midi'])
+            score_track = gr.Dropdown(choices=[('自动选择唯一音符轨 / Auto', 'auto')], value='auto',
+                                     label='导入 MIDI 主唱轨 / Vocal track')
+            import_score = gr.Button("应用到当前片段 / Apply imported score")
+        with gr.Accordion("F0 检查与修正 / Inspect & edit F0", open=False):
+            f0_summary = gr.Textbox(label="F0 诊断 / F0 diagnostics", interactive=False, lines=4)
+            f0_revision = gr.State({})
+            gr.Markdown("F0 以 50Hz JSON 导出。可在音高编辑器中修改 values 数组，长度必须与当前片段一致，静音帧用 0；导回后本段会失效并需重新生成。")
+            with gr.Row():
+                export_f0 = gr.Button("导出 F0 JSON / Export F0")
+                f0_file = gr.File(label="F0 JSON", interactive=False)
+            f0_upload = gr.File(label="导回修正 F0 / Import corrected F0", type='filepath', file_types=['.json'])
+            import_f0 = gr.Button("应用 F0 修正 / Apply F0")
         with gr.Row():
             save = gr.Button("保存歌词 / Save lyrics", visible=mode == "svs")
             regenerate = gr.Button("保存并重新生成此段 / Save & regenerate segment" if mode == "svs" else "重新生成此段 / Regenerate segment", variant="primary")
+        with gr.Accordion("A/B 试听与版本选择 / Compare & select", open=False, visible=mode == "svs"):
+            gr.Markdown("比较使用**已保存**的歌词与乐谱。原词组保留原始对齐，人工改过乐谱时，两组的音符也可能不同。")
+            include_original = gr.Checkbox(value=False, label="同时比较原词 / Include original lyrics (4 renders)")
+            compare = gr.Button("生成独立 A/B 试听 / Generate comparison")
+            with gr.Row():
+                current_melody = gr.Audio(label="当前词 · Melody", interactive=False, type='filepath')
+                current_score = gr.Audio(label="当前词 · Score", interactive=False, type='filepath')
+            with gr.Row():
+                original_melody = gr.Audio(label="原始词/对齐 · Melody", interactive=False, type='filepath')
+                original_score = gr.Audio(label="原始词/对齐 · Score", interactive=False, type='filepath')
+            variant = gr.Dropdown(choices=[], label="可采用的当前词版本 / Available current-lyric versions", interactive=True)
+            variant_audio = gr.Audio(label="所选版本试听 / Selected version", interactive=False, type='filepath')
+            comparison_details = gr.Textbox(label="比较记录 / Comparison record", interactive=False, lines=3)
+            adopt = gr.Button("采用此版本 / Use selected version")
+        with gr.Accordion("人工复核与验收 / Human review", open=True):
+            review_status = gr.Textbox(label="当前片段验收状态 / Segment review", interactive=False, lines=2)
+            review_loaded = gr.State({})
+            gr.Markdown("先核对歌词、音符和 F0 提示，再试听当前生成音频。验收只适用于本次音频及其输入；"
+                        "保存修改或重新生成后需重新试听。原有诊断记录会保留。")
+            with gr.Row():
+                align_review = gr.Button("已核对对齐 / F0 / Inputs reviewed")
+                accept = gr.Button("已试听，验收此段 / Accept listened render", variant='primary')
+                reopen = gr.Button("撤回验收 / Reopen review")
         with gr.Accordion("生成参数 / Generation settings", open=False):
             with gr.Row():
                 seed = gr.Number(value=42, precision=0, label="种子 / Seed")
@@ -334,7 +644,7 @@ def render_workspace(root, mode="svs"):
             with gr.Row():
                 auto_shift = gr.Checkbox(value=False, label="自动变调 / Auto pitch shift")
                 control = gr.Dropdown(choices=[("旋律 / Melody", "melody"), ("乐谱 / Score", "score")],
-                                      value="melody", label="控制类型 / Control", visible=mode == "svs")
+                                      value="score", label="控制类型 / Control", visible=mode == "svs")
                 mix = gr.Checkbox(value=True, label="混入伴奏 / Mix accompaniment")
         run = gr.Button("生成剩余 / 继续任务 · Run remaining (skip completed)", variant="primary", size="lg")
         with gr.Accordion("重新生成全部 / Regenerate all", open=False):
@@ -344,7 +654,14 @@ def render_workspace(root, mode="svs"):
             regenerate_all = gr.Button("重新生成全部 / Regenerate all", variant="stop")
     with gr.Column(elem_classes="workflow-card"):
         gr.Markdown("### 04 · 整曲导出 / Assemble & download")
-        merge = gr.Button("合并完整歌曲 / Assemble full song", variant="primary")
+        with gr.Row():
+            merge = gr.Button("合并试听草稿 / Assemble draft")
+            export_accepted = gr.Button("导出已验收整曲 / Export accepted song", variant="primary")
+            output_sample_rate = gr.Dropdown(
+                choices=[('跟随项目 / Project default', 'auto'), ('24 kHz', '24000'),
+                         ('44.1 kHz', '44100'), ('48 kHz', '48000')],
+                value='auto', label='最终采样率 / Final sample rate', scale=1)
+        gr.Markdown("草稿允许存在待复核片段；已验收导出要求全部演唱片段通过当前版本的人工验收。")
         with gr.Row():
             final = gr.Audio(label="整曲结果 / Full song (mix setting applied)", type="filepath", interactive=False)
             raw = gr.Audio(label="纯人声 / Raw vocal", type="filepath", interactive=False)
@@ -354,16 +671,50 @@ def render_workspace(root, mode="svs"):
     outputs = [manifest, status, table, segment, source_preview, generated_preview, segment_lyrics, final, raw, final_file, raw_file]
     settings = [seed, n_steps, cfg, auto_shift, pitch, control, mix]
     lyric_file.upload(read_lyrics_upload, [lyric_file], [lyrics], queue=False, api_name="long_read_lyrics")
-    prepare.click(workspace.prepare, [source, lyrics, lyric_file, reference, max_seconds, min_gap, language, separate], outputs,
-                  api_name="long_prepare", **GPU_EVENT)
-    load.click(workspace.load, [manifest], outputs, api_name="long_load", queue=False)
-    segment.input(workspace.select, [manifest, segment], [source_preview, generated_preview, segment_lyrics],
-                  api_name="long_select", queue=False)
-    save.click(workspace.save, [manifest, segment, segment_lyrics], outputs, api_name="long_save", **GPU_EVENT)
-    regenerate.click(workspace.regenerate, [manifest, segment, segment_lyrics, *settings], outputs,
-                     api_name="long_regenerate", **GPU_EVENT)
-    run.click(workspace.run, [manifest, *settings], outputs, api_name="long_run", **GPU_EVENT)
-    regenerate_all.click(workspace.regenerate_all, [manifest, confirm, *settings], outputs,
-                         api_name="long_regenerate_all", **GPU_EVENT)
-    merge.click(workspace.merge, [manifest, mix], outputs, api_name="long_merge", **GPU_EVENT)
+    midi_input.change(read_midi_tracks, [midi_input], [midi_track], queue=False, api_name="long_midi_tracks")
+    refresh_events = []
+    refresh_events.append(prepare.click(workspace.prepare, [source, lyrics, lyric_file, reference, max_seconds, min_gap, language, separate, manual_metadata, reference_is_vocal, midi_input, midi_track, reference_start, reference_end, dereverb, reference_dereverb], outputs,
+                  api_name="long_prepare", **GPU_EVENT))
+    refresh_events.append(load.click(workspace.load, [manifest], outputs, api_name="long_load", queue=False))
+    refresh_events.append(segment.input(workspace.select, [manifest, segment], [source_preview, generated_preview, segment_lyrics],
+                  api_name="long_select", queue=False))
+    refresh_events.append(save.click(workspace.save, [manifest, segment, segment_lyrics], outputs, api_name="long_save", **GPU_EVENT))
+    refresh_events.append(regenerate.click(workspace.regenerate, [manifest, segment, segment_lyrics, *settings], outputs,
+                     api_name="long_regenerate", **GPU_EVENT))
+    refresh_events.append(compare.click(workspace.compare, [manifest, segment, seed, n_steps, cfg, auto_shift, pitch, include_original], outputs,
+                  api_name="long_compare", **GPU_EVENT))
+    refresh_events.append(run.click(workspace.run, [manifest, *settings], outputs, api_name="long_run", **GPU_EVENT))
+    refresh_events.append(regenerate_all.click(workspace.regenerate_all, [manifest, confirm, *settings], outputs,
+                         api_name="long_regenerate_all", **GPU_EVENT))
+    refresh_events.append(merge.click(workspace.merge, [manifest, mix, output_sample_rate], outputs, api_name="long_merge", **GPU_EVENT))
+    refresh_events.append(export_accepted.click(workspace.export_accepted, [manifest, mix, output_sample_rate], outputs,
+                                               api_name='long_export_accepted', **GPU_EVENT))
+    refresh_events.append(adopt.click(workspace.adopt, [manifest, segment, variant], outputs,
+                                     api_name='long_adopt_comparison', **GPU_EVENT))
+    for button, action in ((align_review, 'alignment'), (accept, 'accept'), (reopen, 'reopen')):
+        refresh_events.append(button.click(workspace.set_review,
+            [manifest, segment, gr.State(action), review_loaded], outputs, api_name=f'long_review_{action}', **GPU_EVENT))
+    variant.input(workspace.comparison_preview, [manifest, segment, variant], [variant_audio, comparison_details],
+                  api_name='long_comparison_preview', queue=False)
+    refresh_events.append(save_score.click(workspace.save_score, [manifest, segment, note_table, score_revision], outputs,
+                                         api_name='long_save_score', **GPU_EVENT))
+    refresh_events.append(import_score.click(workspace.import_score, [manifest, segment, score_upload, score_track, score_revision], outputs,
+                                           api_name='long_import_score', **GPU_EVENT))
+    refresh_events.append(import_f0.click(workspace.import_f0, [manifest, segment, f0_upload, f0_revision], outputs,
+                                         api_name='long_import_f0', **GPU_EVENT))
+    export_score.click(workspace.export_score, [manifest, segment], [score_json, score_midi],
+                       api_name='long_export_score', **GPU_EVENT)
+    score_upload.change(read_midi_tracks, [score_upload], [score_track], queue=False, api_name='long_score_tracks')
+    export_f0.click(workspace.export_f0, [manifest, segment], [f0_file],
+                    api_name='long_export_f0', **GPU_EVENT)
+    for index, event in enumerate(refresh_events):
+        event.then(workspace.score, [manifest, segment], [note_table, score_revision], queue=False,
+                   api_name='long_score' if index == 0 else False)
+        event.then(workspace.review, [manifest, segment], [review_status, review_loaded], queue=False,
+                   api_name='long_review' if index == 0 else False)
+        event.then(workspace.f0, [manifest, segment], [f0_summary, f0_revision], queue=False,
+                   api_name='long_f0' if index == 0 else False)
+        event.then(workspace.comparisons, [manifest, segment],
+                   [variant, current_melody, current_score, original_melody, original_score, variant_audio, comparison_details],
+                   queue=False, api_name='long_comparisons' if index == 0 else False)
     return workspace

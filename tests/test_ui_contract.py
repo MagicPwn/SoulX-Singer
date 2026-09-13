@@ -100,13 +100,20 @@ class InterfaceBuildTests(unittest.TestCase):
                 self.assertEqual(tabs[0], "整曲工作台")
                 self.assertIn("短片段 / MIDI 高级模式" if module.__name__ == "webui" else "原生歌声转换 / SVC 高级模式", tabs)
                 names = {f.api_name for f in page.fns.values()}
-                self.assertTrue({"long_prepare", "long_load", "long_select", "long_save", "long_run", "long_regenerate", "long_regenerate_all", "long_merge"} <= names)
+                self.assertTrue({"long_prepare", "long_load", "long_select", "long_save", "long_run", "long_regenerate", "long_regenerate_all", "long_merge", "long_compare"} <= names)
+                self.assertTrue({'long_midi_tracks', 'long_score_tracks', 'long_score', 'long_save_score', 'long_import_score', 'long_export_score'} <= names)
+                self.assertTrue({'long_f0', 'long_export_f0', 'long_import_f0'} <= names)
+                self.assertTrue({'long_review', 'long_review_alignment', 'long_review_accept', 'long_review_reopen',
+                                 'long_export_accepted', 'long_adopt_comparison', 'long_comparisons',
+                                 'long_comparison_preview'} <= names)
+                run_event = next(f for f in page.fns.values() if f.api_name == "long_run")
+                self.assertEqual(run_event.inputs[-2].value, "score")
                 legacy = {"_transcribe_prompt", "_transcribe_target", "_edit_metadata", "_run_synthesis"} if module.__name__ == "webui" else {"_start_svc"}
                 seen = set()
                 for f in page.fns.values():
                     if f.fn is None:
                         continue
-                    if f.fn.__name__ in legacy or f.api_name in {"long_prepare", "long_run", "long_save", "long_regenerate", "long_regenerate_all", "long_merge"}:
+                    if f.fn.__name__ in legacy or f.api_name in {"long_prepare", "long_run", "long_save", "long_regenerate", "long_regenerate_all", "long_merge", "long_compare", 'long_save_score', 'long_import_score', 'long_export_score', 'long_review_alignment', 'long_review_accept', 'long_review_reopen', 'long_adopt_comparison', 'long_export_accepted'}:
                         self.assertEqual(f.concurrency_id, "soulx-global-gpu")
                         self.assertEqual(f.concurrency_limit, 1)
                         seen.add(f.fn.__name__)
@@ -170,6 +177,32 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(prepared[0], str(self.path))
         self.assertIn("40", prepared[1])
 
+    def test_score_table_passes_loaded_revision_and_rejects_wrong_segment(self):
+        import numpy as np
+        self.manifest['segments'][0].update(revision=3, metadata=dict(
+            text='春 风', duration='10 10', note_pitch='60 62', note_type='2 2'))
+        self.persist()
+        rows, loaded = self.workspace.score(str(self.path), '0001')
+        self.assertEqual(rows, [['春', 60, 10., 2], ['风', 62, 10., 2]])
+        self.assertEqual(loaded, dict(segment_id='0001', revision=3))
+        service = SimpleNamespace(update_segment_score=Mock(return_value=str(self.path)))
+        with patch.object(self.workspace, '_service', return_value=service):
+            self.workspace.save_score(str(self.path), '0001', np.array(rows, dtype=object), loaded)
+            service.update_segment_score.assert_called_once_with(str(self.path), '0001', notes=rows, expected_revision=3)
+            with self.assertRaises(self.ui.gr.Error):
+                self.workspace.save_score(str(self.path), '0002', rows, loaded)
+        self.assertEqual(service.update_segment_score.call_count, 1)
+
+    def test_midi_track_choice_reaches_prepare_and_segment_import(self):
+        service = SimpleNamespace(prepare_project=Mock(return_value=str(self.path)),
+                                  update_segment_score=Mock(return_value=str(self.path)))
+        with patch.object(self.workspace, '_service', return_value=service):
+            self.workspace.prepare('song.wav', midi_file='song.mid', midi_track='2')
+            self.assertEqual(service.prepare_project.call_args.kwargs['midi_track'], 2)
+            self.workspace.import_score(str(self.path), '0001', 'phrase.mid', '1', dict(segment_id='0001', revision=0))
+            service.update_segment_score.assert_called_once_with(str(self.path), '0001', midi_file='phrase.mid',
+                                                                 midi_track=1, expected_revision=0)
+
     def test_svc_regenerates_without_calling_unsupported_lyric_editor(self):
         self.workspace.mode = "svc"
         self.manifest["mode"] = "svc"
@@ -180,6 +213,31 @@ class WorkspaceTests(unittest.TestCase):
             self.workspace.regenerate(str(self.path), "0002", "")
         service.update_segment_lyrics.assert_not_called()
         self.assertTrue(service.run_project.call_args.kwargs["force"])
+
+    def test_review_uses_loaded_audio_and_input_identity(self):
+        service = SimpleNamespace(review_segment=Mock(return_value=str(self.path)))
+        loaded = dict(segment_id='0001', inputs='input-token', render='audio-token')
+        with patch.object(self.workspace, '_service', return_value=service):
+            self.workspace.set_review(str(self.path), '0001', 'accept', loaded)
+            service.review_segment.assert_called_once_with(str(self.path), '0001', 'accept',
+                expected_inputs='input-token', expected_render='audio-token')
+            with self.assertRaises(self.ui.gr.Error):
+                self.workspace.set_review(str(self.path), '0002', 'accept', loaded)
+            with self.assertRaises(self.ui.gr.Error):
+                self.workspace.set_review(str(self.path), '0001', 'accept', dict(loaded, render=None))
+
+    def test_compare_adoption_and_accepted_export_use_separate_actions(self):
+        service = SimpleNamespace(compare_segment=Mock(return_value=str(self.path)),
+            adopt_comparison=Mock(return_value=str(self.path)),
+            assemble_project=Mock(return_value=str(self.project / 'final.wav')))
+        with patch.object(self.workspace, '_service', return_value=service):
+            self.workspace.compare(str(self.path), '0001', include_original=True)
+            self.assertTrue(service.compare_segment.call_args.kwargs['include_original'])
+            service.adopt_comparison.assert_not_called()
+            self.workspace.adopt(str(self.path), '0001', 'comparison-id:current_score')
+            service.adopt_comparison.assert_called_once_with(str(self.path), '0001', 'comparison-id', 'current_score')
+            self.workspace.export_accepted(str(self.path), False)
+            service.assemble_project.assert_called_once_with(str(self.path), mix=False, require_accepted=True)
 
     def test_service_workflow_preserves_parameters_and_explicit_regeneration(self):
         service = SimpleNamespace(

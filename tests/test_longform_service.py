@@ -11,6 +11,149 @@ import soundfile as sf
 
 
 class ServiceTests(unittest.TestCase):
+    def test_pitch_quality_flags_octave_jumps_and_low_voicing(self):
+        from longform import service
+        f0 = np.full(500, 220.0, dtype=np.float32)
+        f0[100:110] = 440.0
+        quality = service._pitch_quality(f0)
+        self.assertEqual(quality['octave_jump_frames'], 2)
+        self.assertFalse(quality['likely_octave_errors'])
+        sparse = np.zeros(500, dtype=np.float32)
+        sparse[200:220] = 220.0
+        self.assertTrue(service._pitch_quality(sparse)['low_voiced_ratio'])
+
+    def test_segment_pitch_review_is_persisted_and_backfilled_on_resume(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.wav'
+            sf.write(source, np.zeros(10 * 24000), 24000)
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', return_value=np.tile([220., 440.], 250)):
+                path = service.prepare_project(source, mode='svc', separate=False)
+            manifest = json.loads(Path(path).read_text(encoding='utf-8'))
+            segment = manifest['segments'][0]
+            self.assertTrue(segment['needs_manual_review'])
+            self.assertEqual(segment['review_reasons'], ['octave_jumps'])
+            # Simulate a cached checkpoint written before segment F0 diagnostics.
+            segment.pop('pitch_quality')
+            segment.pop('needs_manual_review')
+            segment['review_reasons'] = ['asr_empty']
+            segment['warning'] = 'ASR result needs review'
+            with patch.object(service, '_extract_f0', side_effect=AssertionError('reuse F0')), \
+                 patch.object(service, '_crop', side_effect=AssertionError('reuse audio')):
+                service._prepare_remaining(manifest, path)
+                service._prepare_remaining(manifest, path)
+            saved = json.loads(Path(path).read_text(encoding='utf-8'))['segments'][0]
+            self.assertTrue(saved['needs_manual_review'])
+            self.assertCountEqual(saved['review_reasons'], ['asr_empty', 'octave_jumps'])
+            self.assertEqual(saved['warning'].count('F0 quality requires review'), 1)
+
+    def test_prompt_quality_tracks_short_asr_fallback(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.wav'
+            pitch = root / 'source_f0.npy'
+            sf.write(source, np.zeros(12 * 24000), 24000)
+            np.save(pitch, np.full(600, 220.0))
+            choices = [dict(start=0., end=12.), dict(start=2., end=4.52)]
+            prompt = dict(id='prompt', source_path=str(root / 'prompt.wav'),
+                          f0_path=str(root / 'prompt_f0.npy'), origin_path=str(source),
+                          origin_f0_path=str(pitch), candidates=choices)
+            service._set_prompt_clip(prompt, choices[0])
+            self.assertFalse(prompt['quality']['short_reference'])
+            transcriber = Mock()
+            transcriber.process.side_effect = [(['<SP>'], [12.]), (['春'], [2.52])]
+            module = SimpleNamespace(LyricTranscriber=Mock(return_value=transcriber))
+            with patch.dict(sys.modules, {'preprocess.tools.lyric_transcription': module}), \
+                 patch.object(service, '_device', return_value='cpu'), patch.object(service, '_release'):
+                result = list(service._asr_items([prompt], 'Mandarin'))
+            self.assertEqual(result[0][1], ['春'])
+            self.assertAlmostEqual(prompt['quality']['duration_seconds'], 2.52)
+            self.assertTrue(prompt['quality']['short_reference'])
+            self.assertIn('shorter than 8s', prompt['warning'])
+            self.assertEqual(sf.info(prompt['source_path']).frames, round(2.52 * 24000))
+
+    def test_energy_frames_keep_stereo_power_and_fractional_sample_alignment(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'stereo.wav'
+            rate = 11025
+            count = 601
+            mono = np.sin(np.arange(round(12.019 * rate)) * .13) * .1
+            audio = np.column_stack((mono, -mono))
+            sf.write(source, audio, rate, subtype='FLOAT')
+            actual = service._frame_rms(source, count)
+            decoded, _ = sf.read(source, always_2d=True)
+            expected = [np.sqrt(np.mean(decoded[round(i * rate / 50):round((i + 1) * rate / 50)] ** 2))
+                        for i in range(count)]
+            np.testing.assert_allclose(actual, expected, atol=1e-10)
+            self.assertGreater(actual.min(), .01)
+            with self.assertRaisesRegex(ValueError, 'timeline'):
+                service._frame_rms(source, 500)
+            sf.write(source, np.full(rate, np.nan), rate, subtype='FLOAT')
+            with self.assertRaisesRegex(ValueError, 'non-finite'):
+                service._frame_rms(source, 50)
+
+    def test_fast_song_resumes_failed_pitch_cache_without_extending_cap(self):
+        from contextlib import contextmanager
+        from longform import core, service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'fast.wav'
+            f0 = np.full(1600, 220.0)
+            f0[700:710] = 0
+            amplitude = np.where(f0 > 0, .1, .001)
+            audio = np.repeat(amplitude, 480) * np.sin(np.arange(32 * 24000) * 2 * np.pi * 220 / 24000)
+            sf.write(source, audio, 24000, subtype='FLOAT')
+            original_planner = core.plan_segments
+            def strict_planner(*args, **kwargs):
+                kwargs.pop('frame_rms', None)
+                return original_planner(*args, **kwargs)
+            calls = []
+            @contextmanager
+            def renderer(manifest):
+                self.assertLessEqual(manifest['prompt']['end'], 28)
+                def generate(segment, output_path, **options):
+                    calls.append(segment['id'])
+                    sf.write(output_path, np.full(round((segment['end'] - segment['start']) * 24000), .1), 24000)
+                    return 0
+                yield generate
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', return_value=f0), \
+                 patch.object(core, 'plan_segments', side_effect=strict_planner):
+                with self.assertRaisesRegex(service.ProjectError, 'No safe cut') as failed:
+                    service.prepare_project(source, mode='svc', separate=False)
+            path = failed.exception.manifest_path
+            before = json.loads(Path(path).read_text(encoding='utf-8'))
+            self.assertEqual(before['phase'], 'pitch')
+            self.assertEqual(before['segments'], [])
+            cache = {key: Path(before[key]).read_bytes() for key in ('source', 'vocal_path', 'f0_path')}
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', side_effect=AssertionError('must reuse cached F0')), \
+                 patch.object(service, '_separate_audio', side_effect=AssertionError('must reuse cached vocals')), \
+                 patch.object(service, '_renderer', renderer):
+                service.run_project(path, mix=False)
+                done = json.loads(Path(path).read_text(encoding='utf-8'))
+                self.assertEqual(done['status'], 'completed')
+                self.assertIsNone(done['error'])
+                self.assertEqual(done['id'], before['id'])
+                self.assertEqual(done['max_seconds'], 28)
+                self.assertEqual(done['min_gap'], .3)
+                self.assertEqual(done['segments'][0]['boundary'], 'short_breath')
+                for segment in done['segments']:
+                    self.assertLessEqual(segment['end'] - segment['start'], 28)
+                self.assertEqual(sf.info(done['output_path']).frames, 32 * 24000)
+                for key, data in cache.items():
+                    self.assertEqual(Path(done[key]).read_bytes(), data)
+                calls_before = list(calls)
+                service.run_project(path, mix=False)
+                self.assertEqual(calls, calls_before)
+
     def test_prepare_is_persistent_and_keeps_full_source(self):
         self.assertIsNotNone(importlib.util.find_spec('longform.service'),
                              'persistent service has not been implemented')
@@ -549,6 +692,150 @@ class ServiceTests(unittest.TestCase):
                 np.testing.assert_allclose(audio[[0, -1]], [[.1, .2], [.1, .2]], atol=1e-6)
                 self.assertEqual(float(np.max(np.abs(raw))), 0)
 
+    def test_manual_metadata_bypasses_target_transcription(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.wav'
+            metadata = root / 'edited.json'
+            sf.write(source, np.zeros(6 * 24000), 24000)
+            metadata.write_text(json.dumps([{
+                'language': 'Mandarin', 'time': [0, 6000],
+                'duration': '3 3', 'text': '春 风',
+                'note_pitch': '60 62', 'note_type': '2 2',
+            }], ensure_ascii=False), encoding='utf-8')
+
+            def asr(items, language):
+                for item in items:
+                    yield item, ['春'], [item['end'] - item['start']]
+
+            def notes(items, language):
+                for item in items:
+                    self.assertEqual(item['id'], 'prompt')
+                    yield item, dict(note_text=['春'], note_dur=[item['end'] - item['start']],
+                                     note_pitch=[60], note_type=[2])
+
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', return_value=np.full(300, 220.0)), \
+                 patch.object(service, '_asr_items', asr), \
+                 patch.object(service, '_note_items', notes):
+                path = service.prepare_project(source, lyrics_text='春风', metadata_file=metadata,
+                                               separate=False)
+                manifest = json.loads(Path(path).read_text(encoding='utf-8'))
+                segment = next(item for item in manifest['segments'] if item['voiced'])
+                self.assertTrue(manifest['manual_metadata_applied'])
+                self.assertEqual(segment['metadata']['text'], '春 风')
+                self.assertEqual(segment['metadata']['note_pitch'], '60 62')
+                self.assertFalse(segment.get('needs_manual_review', False))
+
+    def test_manual_metadata_uses_absolute_times_when_boundaries_differ(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / 'edited.json'
+            metadata.write_text(json.dumps([{
+                'time': [0, 10000], 'duration': '10', 'text': '啊',
+                'note_pitch': '60', 'note_type': '2',
+            }], ensure_ascii=False), encoding='utf-8')
+            manifest = {
+                'manual_metadata_path': str(metadata), 'language': 'Mandarin',
+                'lyrics_text': '', 'lyrics_assigned': False,
+                'segments': [
+                    {'id': '0001', 'start': 0.0, 'end': 4.0, 'voiced': True, 'source_path': str(root / 'a.wav'),
+                     'pitch_quality': service._pitch_quality(np.tile([220., 440.], 100))},
+                    {'id': '0002', 'start': 4.0, 'end': 10.0, 'voiced': True, 'source_path': str(root / 'b.wav')},
+                ],
+            }
+            def fake_convert(item):
+                return {'text': ' '.join(item.note_text), 'note_pitch': ' '.join(map(str, item.note_pitch)),
+                        'note_type': ' '.join(map(str, item.note_type)), 'duration': ' '.join(map(str, item.note_dur)),
+                        'phoneme': 'a', 'f0': ''}
+            with patch('preprocess.utils.convert_metadata', side_effect=fake_convert), \
+                 patch('longform.lyrics.assign_lyrics', side_effect=lambda bases, text, language: bases):
+                service._apply_manual_metadata(manifest, root / 'manifest.json')
+            self.assertEqual(manifest['segments'][0]['metadata']['duration'], '4.00000000')
+            self.assertEqual(manifest['segments'][1]['metadata']['duration'], '6.00000000')
+            self.assertTrue(manifest['segments'][0]['needs_manual_review'])
+            self.assertEqual(manifest['segments'][0]['review_reasons'], ['octave_jumps'])
+            self.assertFalse(manifest['segments'][1]['needs_manual_review'])
+
+    def test_manual_score_protects_long_notes_from_f0_dropouts(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, metadata = root / 'source.wav', root / 'score.json'
+            sf.write(source, np.zeros(18 * 24000), 24000)
+            metadata.write_text(json.dumps([dict(time=[0, 18000], duration='4 10 4',
+                text='<SP> 春 <SP>', note_pitch='0 60 0', note_type='1 2 1')]), encoding='utf-8')
+            pitch = np.full(18 * 50, 220.)
+            pitch[6 * 50:12 * 50] = 0
+            def asr(items, language):
+                for item in items:
+                    self.assertEqual(item['id'], 'prompt')
+                    yield item, ['春'], [item['end']]
+            def notes(items, language):
+                for item in items:
+                    yield item, dict(note_text=['春'], note_pitch=[60], note_type=[2], note_dur=[item['end']])
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', return_value=pitch), \
+                 patch.object(service, '_asr_items', asr), patch.object(service, '_note_items', notes):
+                path = service.prepare_project(source, metadata_file=metadata, separate=False, max_seconds=12)
+            result = json.loads(Path(path).read_text(encoding='utf-8'))
+            self.assertEqual(result['planning_source'], 'manual_score')
+            self.assertTrue(all(not 4 < s['end'] < 14 for s in result['segments']))
+            pitched = [float(d) for s in result['segments'] if s['voiced']
+                       for d, p in zip(s['metadata']['duration'].split(), s['metadata']['note_pitch'].split())
+                       if int(p) > 0]
+            self.assertEqual(pitched, [10.])
+            self.assertEqual(result['segments'][-1]['end'], 18.)
+
+    def test_manual_score_recovers_vocals_when_target_f0_is_entirely_missing(self):
+        from longform import service
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, reference, metadata = root / 'source.wav', root / 'ref.wav', root / 'score.json'
+            sf.write(source, np.zeros(6 * 24000), 24000)
+            sf.write(reference, np.zeros(8 * 24000), 24000)
+            metadata.write_text(json.dumps([dict(time=[0, 6000], duration='6',
+                text='春', note_pitch='60', note_type='2')]), encoding='utf-8')
+            def pitch(path):
+                return np.full(400, 220.) if Path(path).name == 'reference_vocal.wav' else np.zeros(300)
+            def asr(items, language):
+                for item in items:
+                    self.assertEqual(item['id'], 'prompt')
+                    yield item, ['春'], [item['end']]
+            def notes(items, language):
+                for item in items:
+                    yield item, dict(note_text=['春'], note_pitch=[60], note_type=[2], note_dur=[item['end']])
+            with patch.object(service, 'OUTPUT_ROOT', root / 'jobs'), \
+                 patch.object(service, '_extract_f0', side_effect=pitch), \
+                 patch.object(service, '_asr_items', asr), patch.object(service, '_note_items', notes):
+                path = service.prepare_project(source, metadata_file=metadata, reference=reference, separate=False)
+            result = json.loads(Path(path).read_text(encoding='utf-8'))
+            self.assertTrue(result['segments'][0]['voiced'])
+            self.assertEqual(result['segments'][0]['metadata']['text'], '春')
+            self.assertIn('low_f0_voicing', result['segments'][0]['review_reasons'])
+
+    def test_midi_input_is_converted_to_manual_metadata(self):
+        from longform import service
+        import mido
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            midi = root / 'song.mid'
+            output = root / 'metadata.json'
+            mid = mido.MidiFile(ticks_per_beat=500)
+            track = mido.MidiTrack()
+            mid.tracks.append(track)
+            track.append(mido.MetaMessage('set_tempo', tempo=500000, time=0))
+            track.append(mido.MetaMessage('lyrics', text='春'.encode('utf-8').decode('latin1'), time=0))
+            track.append(mido.Message('note_on', note=60, velocity=64, time=0))
+            track.append(mido.Message('note_off', note=60, velocity=0, time=500))
+            mid.save(midi)
+            service._midi_to_metadata(midi, output, 'Mandarin')
+            payload = json.loads(output.read_text(encoding='utf-8'))
+            self.assertEqual(payload[0]['text'], '春')
+            self.assertEqual(payload[0]['note_pitch'], '60')
+            self.assertEqual(payload[0]['note_type'], '2')
 
 if __name__ == '__main__':
     unittest.main()
